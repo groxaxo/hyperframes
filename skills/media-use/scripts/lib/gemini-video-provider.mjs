@@ -4,7 +4,7 @@ import { join } from "node:path";
 import {
   GEMINI_OMNI_VIDEO_MODEL,
   createGeminiInteraction,
-  decodeGeminiMedia,
+  readGeminiMedia,
   findGeminiMedia,
   geminiApiKey,
   geminiCredentialHint,
@@ -51,6 +51,7 @@ export async function geminiVideoGenerate(intent, ctx = {}, deps = {}) {
       response_format: {
         type: "video",
         aspect_ratio: aspectRatio,
+        delivery: "uri",
       },
       background: false,
       store: false,
@@ -69,7 +70,16 @@ export async function geminiVideoGenerate(intent, ctx = {}, deps = {}) {
     if (!block) {
       throw new Error("Gemini Omni returned no video output");
     }
-    const videoBytes = decodeGeminiMedia(block, "video");
+    const videoBytes = await readGeminiMedia(block, "video", {
+      apiKey,
+      env,
+      fetch: deps.fetch,
+      sleep: deps.sleep,
+      pollIntervalMs: deps.pollIntervalMs,
+      timeoutMs: deps.fileTimeoutMs || 900_000,
+      requestTimeoutMs: deps.fileRequestTimeoutMs || 120_000,
+      retries: deps.retries ?? 2,
+    });
     const outputPath = join(
       tmpdir(),
       `media-use-gemini-omni-${process.pid}-${Date.now()}-${Math.random()
@@ -88,6 +98,7 @@ export async function geminiVideoGenerate(intent, ctx = {}, deps = {}) {
           prompt: intent,
           model: GEMINI_OMNI_VIDEO_MODEL,
           aspect_ratio: aspectRatio,
+          delivery: "uri",
           native_audio: true,
         },
       },
