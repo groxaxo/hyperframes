@@ -3,22 +3,22 @@
 // Each media type maps to an ORDERED list of provider entries. Providers are
 // tried in order; the first to return a non-null result wins, which keeps
 // resolution deterministic (same request -> same provider -> same file ->
-// reproducible renders). For video and TTS, Gemini is preferred when a Google
-// API key is present; its provider returns null when unconfigured so the
-// established HeyGen and local fallbacks remain intact.
+// reproducible renders). A configured self-hosted ComfyUI LTX-2.3 workflow is
+// preferred for video; cloud providers and the existing local CLI remain intact.
 //
 // An entry exposes any of three capability methods — search / generate /
 // process — plus { name }. media-use holds no keys; each external service owns
 // its auth and media-use reads credentials from its normal environment.
 // Providers, by type:
+//   - ComfyUI: self-hosted LTX-2.3 API workflows with synchronized audio/video
 //   - Gemini: Omni Flash video with native audio and Gemini 3.1 Flash TTS
 //   - heygen CLI: catalog + TTS + avatar video
 //   - mflux: local FLUX-class image gen, spec-selected to the machine's RAM
 //   - codex CLI: image gen on the user's ChatGPT sub
 //   - Kokoro / LTX: local voice and video fallbacks
 //
-// Generation is cloud-preferred where configured, with local fallbacks.
-// `ctx.provider` forces one provider (e.g. "make a video with gemini").
+// Generation is self-hosted-first where configured, then cloud, then local CLI.
+// `ctx.provider` forces one provider (e.g. "make a video with comfyui").
 
 import { bgmProvider } from "./bgm-provider.mjs";
 import { sfxProvider } from "./sfx-provider.mjs";
@@ -35,19 +35,21 @@ import { geminiTtsGenerate } from "./gemini-tts-provider.mjs";
 import { geminiVideoGenerate } from "./gemini-video-provider.mjs";
 import { heygenTtsGenerate } from "./voice-provider.mjs";
 import { heygenVideoGenerate } from "./heygen-video-provider.mjs";
+import { ltx23ComfyUiGenerate } from "./ltx-comfyui-provider.mjs";
 import { ltxVideoGenerate } from "./ltx-video-provider.mjs";
 import { localTtsGenerate } from "./tts-local-provider.mjs";
 import { codexImageGenerate } from "./codex-provider.mjs";
 import { mfluxImageGenerate } from "./mflux-provider.mjs";
 
-// Provider markers: `network` = hits a remote service (skipped by --local-only).
-// `paid` = can consume metered credits. A user-requested call runs; an
-// agent-initiated paid call follows the media-use cost-confirmation rule.
+// Provider markers: `network` = uses HTTP or another remote transport and is
+// skipped by the hard --local-only guard. Self-hosted ComfyUI is free and private,
+// but still uses HTTP, so it is marked network; the direct local LTX CLI remains
+// the zero-network fallback. `paid` = can consume metered credits.
 const A = (name, caps) => ({ name, ...caps }); // local, free
-const N = (name, caps) => ({ name, network: true, ...caps }); // remote, free
+const N = (name, caps) => ({ name, network: true, ...caps }); // network, free
 const P = (name, caps) => ({ name, network: true, paid: true, ...caps }); // remote, paid
 
-// Remote providers are skipped by --local-only.
+// Every network provider is skipped by --local-only.
 const REGISTRY = {
   bgm: [N("heygen.audio.sounds", { search: bgmProvider.search })],
   sfx: [
@@ -83,8 +85,10 @@ const REGISTRY = {
     A("kokoro.local", { generate: localTtsGenerate }),
   ],
   video: [
-    // Gemini Omni generates general-purpose video with a native audio track.
-    // HeyGen remains the avatar-video fallback; LTX remains fully local.
+    // A configured API-format LTX-2.3 workflow runs on the user's own ComfyUI
+    // first. It returns null when unconfigured, so existing installations retain
+    // Gemini → HeyGen → local LTX behavior with no extra network probe.
+    N("comfyui.ltx23", { generate: ltx23ComfyUiGenerate }),
     P("gemini.omni", { generate: geminiVideoGenerate }),
     P("heygen.video", { generate: heygenVideoGenerate }),
     A("ltx.local", { generate: ltxVideoGenerate }),
@@ -126,8 +130,8 @@ export function providerNamesFor(type) {
 }
 
 /**
- * Does an override token (full name like "gemini.omni" or a prefix like
- * "gemini") match any provider declared for the type? Same match rule as
+ * Does an override token (full name like "comfyui.ltx23" or a prefix like
+ * "comfyui") match any provider declared for the type? Same match rule as
  * runProviders, so validation and dispatch never disagree.
  */
 export function providerMatches(type, want) {
@@ -149,19 +153,17 @@ export function getProvider(type) {
  * order, returns the first non-null result, skips providers that don't expose
  * the capability. Pure over its input — the unit-testable core of the cascade.
  *
- * Offline guard: a `network` provider is skipped when `ctx.localOnly` is set —
- * unconditionally, even under a `ctx.provider` override. --local-only is a hard
- * safety flag: it must never make a network call. Forcing a network provider
- * while offline yields a clean miss (the caller explains the conflict), never a
- * silent network request.
- * Provider override: `ctx.provider` (a full name like "gemini.omni" or a prefix
- * like "gemini") pins resolution to matching providers only.
+ * Offline guard: every `network` provider is skipped when `ctx.localOnly` is
+ * set — unconditionally, even under a `ctx.provider` override. ComfyUI uses
+ * HTTP, so `--local-only` selects the direct local LTX CLI instead.
+ * Provider override: `ctx.provider` (a full name like "comfyui.ltx23" or a
+ * prefix like "comfyui") pins resolution to matching providers only.
  */
 export async function runProviders(providers, capability, intent, ctx) {
   const want = ctx?.provider;
   for (const p of providers) {
     if (want && p.name !== want && !p.name.startsWith(`${want}.`)) continue;
-    if (p.network && ctx?.localOnly) continue; // --local-only wins, even over --provider
+    if (p.network && ctx?.localOnly) continue; // --local-only wins over every HTTP provider
     const fn = p[capability];
     if (typeof fn !== "function") continue;
     const res = await fn(intent, ctx);

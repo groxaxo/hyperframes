@@ -38,9 +38,9 @@ test("heygen provider is first for every catalog type it serves", () => {
   }
 });
 
-test("sanctioned providers only: Gemini, HeyGen, local generators, codex, design and logo tiers", () => {
+test("sanctioned providers only: ComfyUI, Gemini, HeyGen, local generators, codex, design and logo tiers", () => {
   const allowed =
-    /^gemini\.(?:omni|tts)$|^heygen|^bundled\.sfx$|^mflux\.local$|^kokoro\.local$|^ltx\.local$|^codex\.image_gen$|^design_spec$|^svgl$|^simple-icons$|^github\.avatar$|^favicon\.ddg$|^color_grade\.local$|^cube_lut\.local$/;
+    /^comfyui\.ltx23$|^gemini\.(?:omni|tts)$|^heygen|^bundled\.sfx$|^mflux\.local$|^kokoro\.local$|^ltx\.local$|^codex\.image_gen$|^design_spec$|^svgl$|^simple-icons$|^github\.avatar$|^favicon\.ddg$|^color_grade\.local$|^cube_lut\.local$/;
   for (const t of listTypes()) {
     for (const p of getProviders(t)) {
       assert.ok(allowed.test(p.name), `${t} lists unsanctioned provider: ${p.name}`);
@@ -74,21 +74,25 @@ test("voice cascade: Gemini first, then HeyGen, with Kokoro as local fallback", 
   assert.ok(!ps[2].paid, "local Kokoro is free");
 });
 
-test("video cascade: Gemini Omni first, then HeyGen, then LTX; all generate-only", async () => {
+test("video cascade: configured self-hosted LTX-2.3 first, then cloud, then local CLI", async () => {
   assert.deepEqual(providerNamesFor("video"), [
+    "comfyui.ltx23",
     "gemini.omni",
     "heygen.video",
     "ltx.local",
   ]);
+  assert.equal(providerMatches("video", "comfyui"), true);
   assert.equal(providerMatches("video", "gemini"), true);
   assert.equal(providerMatches("video", "ltx.local"), true);
 
   const ps = getProviders("video");
-  assert.ok(ps[0].network, "Gemini Omni is network (skipped under --local-only)");
-  assert.ok(ps[0].paid, "Gemini Omni consumes metered API credits");
-  assert.ok(ps[1].network, "HeyGen video is network (skipped under --local-only)");
-  assert.ok(ps[1].paid, "HeyGen video may bill after the OAuth free allowance");
-  assert.ok(!ps[2].network, "local LTX is kept under --local-only");
+  assert.ok(ps[0].network, "self-hosted ComfyUI uses HTTP and is skipped by --local-only");
+  assert.ok(!ps[0].paid, "self-hosted ComfyUI has no vendor credit charge");
+  assert.ok(ps[1].network, "Gemini Omni is network (skipped under --local-only)");
+  assert.ok(ps[1].paid, "Gemini Omni consumes metered API credits");
+  assert.ok(ps[2].network, "HeyGen video is network (skipped under --local-only)");
+  assert.ok(ps[2].paid, "HeyGen video may bill after the OAuth free allowance");
+  assert.ok(!ps[3].network, "local LTX is kept under --local-only");
   assert.equal(await runCapability("video", "search", "x", {}), null);
 });
 
@@ -129,6 +133,25 @@ test("ctx.provider forces one generator (e.g. 'make an image WITH codex')", asyn
     await runProviders(providers, "generate", "x", { provider: "mflux", localOnly: true }),
     { hit: "local" },
   );
+});
+
+test("--local-only skips self-hosted ComfyUI because its API still uses HTTP", async () => {
+  let comfyUiRan = false;
+  const providers = [
+    {
+      name: "comfyui.ltx23",
+      network: true,
+      generate: async () => {
+        comfyUiRan = true;
+        return { hit: "comfyui" };
+      },
+    },
+    { name: "ltx.local", generate: async () => ({ hit: "local" }) },
+  ];
+  assert.deepEqual(await runProviders(providers, "generate", "x", { localOnly: true }), {
+    hit: "local",
+  });
+  assert.equal(comfyUiRan, false);
 });
 
 test("provider prefix can pin both Gemini capabilities by media type", async () => {
@@ -222,7 +245,7 @@ test("runCapability('bgm','process') is null — process slot is graceful when u
   assert.equal(await runCapability("bgm", "process", "x", {}), null);
 });
 
-test("--local-only skips every network provider (even free remote ones)", async () => {
+test("--local-only skips every network provider", async () => {
   let remoteRan = false;
   const providers = [
     {

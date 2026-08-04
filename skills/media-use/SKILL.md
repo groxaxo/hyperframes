@@ -1,13 +1,13 @@
 ---
 name: media-use
-description: Agent Media OS, the single skill for every media need in a HyperFrames project. Resolve BGM, SFX, image, icon, brand logo, voice, generated video, color grade, or LUT into a frozen local file or paste-ready block + ledger record (one verb, `resolve`); generate video with Gemini Omni Flash, narration with Gemini 3.1 Flash TTS, and fall back to HeyGen or local providers; produce voiceover, transcription, captions, and background removal through one shared audio engine; operate on media (cut / reframe / transform); and reuse assets across projects. Also use for vague feedback that real footage looks dark, flat, boring, should feel retro/camcorder/print/ASCII, needs privacy, or needs a media reveal.
+description: Agent Media OS, the single skill for every media need in a HyperFrames project. Resolve BGM, SFX, image, icon, brand logo, voice, generated video, color grade, or LUT into a frozen local file or paste-ready block + ledger record (one verb, `resolve`); generate video through self-hosted ComfyUI LTX-2.3 or Gemini Omni Flash, narration with Gemini 3.1 Flash TTS, and retain HeyGen and local fallbacks; produce voiceover, transcription, captions, and background removal through one shared audio engine; operate on media (cut / reframe / transform); and reuse assets across projects. Also use for vague feedback that real footage looks dark, flat, boring, should feel retro/camcorder/print/ASCII, needs privacy, or needs a media reveal.
 ---
 
 # media-use
 
 The media OS for HyperFrames: resolve · generate · operate · remember — every media type, one skill, zero context noise.
 
-For generated video and cloud narration, set `GEMINI_API_KEY` (or `GOOGLE_API_KEY`). Gemini Omni Flash is the preferred video generator and Gemini 3.1 Flash TTS is the preferred cloud voice provider. For catalog search, avatar-video fallback, and the HeyGen TTS fallback, install and sign in to the `heygen` CLI. Verify the wider toolchain with `node <SKILL_DIR>/scripts/resolve.mjs --doctor`. Setup and providers: `references/setup-providers.md`.
+For private generated video, configure a self-hosted ComfyUI LTX-2.3 API workflow. Otherwise set `GEMINI_API_KEY` (or `GOOGLE_API_KEY`) for Gemini Omni video and Gemini 3.1 Flash TTS. For catalog search, avatar-video fallback, and the HeyGen TTS fallback, install and sign in to the `heygen` CLI. Verify the wider toolchain with `node <SKILL_DIR>/scripts/resolve.mjs --doctor`. Setup and providers: `references/setup-providers.md`.
 
 ## Resolve — the one verb
 
@@ -17,19 +17,37 @@ node <SKILL_DIR>/scripts/resolve.mjs --type <type> --intent "<description>" --pr
 
 Returns one line: `resolved <id> → <path> (<type>, <metadata>)`. All search noise stays on disk.
 
-| Type    | One-line intent                                                                                         |
-| ------- | ------------------------------------------------------------------------------------------------------- |
-| `bgm`   | background music (HeyGen catalog, 10k+ tracks)                                                          |
-| `sfx`   | sound effects (bundled 19-file library + catalog)                                                       |
-| `image` | photos, backgrounds (HeyGen asset search, local mflux, Codex image generation)                          |
-| `icon`  | icons, symbols (transparent)                                                                            |
-| `logo`  | official brand marks (svgl → simple-icons → GitHub avatar → favicon; never redrawn)                     |
-| `voice` | TTS voiceover (Gemini 3.1 Flash TTS → HeyGen → local Kokoro)                                            |
-| `video` | generated MP4 (Gemini Omni Flash with native audio → HeyGen avatar video → local LTX)                   |
-| `grade` | measured correction candidate; broad polish/stylization follows Media Treatments                        |
-| `lut`   | user-provided or explicitly chosen reusable validated `.cube` file                                      |
+| Type    | One-line intent                                                                                                                  |
+| ------- | -------------------------------------------------------------------------------------------------------------------------------- |
+| `bgm`   | background music (HeyGen catalog, 10k+ tracks)                                                                                   |
+| `sfx`   | sound effects (bundled 19-file library + catalog)                                                                                |
+| `image` | photos, backgrounds (HeyGen asset search, local mflux, Codex image generation)                                                   |
+| `icon`  | icons, symbols (transparent)                                                                                                     |
+| `logo`  | official brand marks (svgl → simple-icons → GitHub avatar → favicon; never redrawn)                                              |
+| `voice` | TTS voiceover (Gemini 3.1 Flash TTS → HeyGen → local Kokoro)                                                                     |
+| `video` | generated video (self-hosted ComfyUI LTX-2.3 → Gemini Omni → HeyGen avatar video → direct local LTX)                             |
+| `grade` | measured correction candidate; broad polish/stylization follows Media Treatments                                                 |
+| `lut`   | user-provided or explicitly chosen reusable validated `.cube` file                                                               |
 
 Before resolving fresh, list reusable candidates with `--candidates` and judge fit yourself — reuse rules, all flags, ingest (`--from`), and adopt are in `references/resolve.md`.
+
+### Self-hosted LTX-2.3
+
+Export a working LTX-2.3 graph with ComfyUI's **Save (API Format)** option, put `{{PROMPT}}` in its positive-prompt scalar, and configure:
+
+```bash
+export COMFYUI_URL=http://127.0.0.1:8188
+export COMFYUI_LTX23_WORKFLOW=/absolute/path/to/ltx23-api.json
+node <SKILL_DIR>/scripts/resolve.mjs \
+  --type video \
+  --provider comfyui \
+  --intent "A cinematic product reveal with synchronized environmental audio" \
+  --project .
+```
+
+The adapter binds prompt, negative prompt, deterministic seed, dimensions, frame count, FPS, model, and output prefix; submits `/prompt`; polls history; interrupts the exact prompt on timeout; downloads `/view`; and records native audio provenance. The graph remains the source of truth, so official single-stage, two-stage, low-VRAM, Q8, and custom LTX-2.3 workflows all use the same adapter. Full workflow contract: `references/comfyui-ltx23.md`.
+
+### Gemini Omni
 
 Force Gemini when the brief explicitly requests it:
 
@@ -45,7 +63,7 @@ node <SKILL_DIR>/scripts/resolve.mjs \
   --project .
 ```
 
-Gemini Omni returns an MP4 with a native generated audio track. Preserve it unless the composition deliberately replaces it. Generate separate Gemini TTS only when the workflow needs controlled narration, exact copy, caption timing, or a different voice; do not stack narration over Omni audio accidentally.
+Gemini Omni returns an MP4 with a native generated audio track. Preserve it unless the composition deliberately replaces it. Generate separate Gemini TTS only when the workflow needs controlled narration, exact copy, caption timing, or a different voice; do not stack narration over generated video audio accidentally.
 
 ## Treat broad visual feedback as media intent
 
@@ -104,6 +122,7 @@ Rules that keep this a help, not nagware: **grounded, not generic** (no signal �
 | Task                                                                      | Read                             |
 | ------------------------------------------------------------------------- | -------------------------------- |
 | resolve / reuse / adopt / ingest, flags, cascade, inventory               | `references/resolve.md`          |
+| self-hosted ComfyUI LTX-2.3 workflow export, bindings, auth, operations   | `references/comfyui-ltx23.md`    |
 | color grading, LUTs, smart grade (`--for`), grade-compare                 | `references/grading.md`          |
 | voiceover / TTS, music, SFX, captions, transcription (audio engine)       | `references/audio.md`            |
 | cut / reframe / transform existing media, exact error diffusion, HEVC     | `references/operations.md`       |
