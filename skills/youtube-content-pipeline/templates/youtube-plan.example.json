@@ -1,0 +1,97 @@
+{
+  "version": 1,
+  "topic": "Why missed calls cost service businesses more than they think",
+  "channel": {
+    "name": "Auckland Automate IT",
+    "audience": "New Zealand service-business owners"
+  },
+  "video": {
+    "slug": "the-hidden-cost-of-missed-calls",
+    "format": "long",
+    "title": "The Hidden Cost of Every Missed Call",
+    "description": "A practical explanation of how missed calls turn into lost jobs — and how an automated response workflow closes the gap.",
+    "tags": ["small business", "automation", "New Zealand", "lead generation"],
+    "category_id": "28",
+    "privacy": "private",
+    "made_for_kids": false,
+    "contains_synthetic_media": true,
+    "language": "en-NZ",
+    "thumbnail": {
+      "headline": "MISSED CALL = LOST JOB?",
+      "subhead": "The leak nobody measures",
+      "accent": "#7c3aed"
+    }
+  },
+  "production": {
+    "provider_policy": "hybrid",
+    "gemini_voice": "Kore",
+    "transition_s": 0.3,
+    "lead_in_s": 0.25,
+    "tail_s": 0.35,
+    "words_per_minute": 165,
+    "max_concurrency": 1,
+    "default_native_audio": "mute",
+    "background_music": false,
+    "background_music_query": "subtle modern technology documentary underscore"
+  },
+  "scenes": [
+    {
+      "id": "hook",
+      "role": "hook",
+      "provider": "gemini",
+      "duration_s": 5,
+      "narration": "A missed call is often a customer choosing the next business on Google.",
+      "visual_prompt": "Cinematic close-up of a phone ringing unanswered in a busy New Zealand trade workshop, realistic natural light, immediate tension, precise camera push-in, synchronized workshop ambience",
+      "on_screen_text": "ONE MISSED CALL",
+      "native_audio": "duck"
+    },
+    {
+      "id": "the-leak",
+      "role": "broll",
+      "provider": "comfyui",
+      "duration_s": 5,
+      "narration": "The loss is invisible because the job never reaches your calendar or quote system.",
+      "visual_prompt": "LTX-2.3 cinematic B-roll, empty appointment calendar and unanswered call notifications, modern service business office, controlled slow lateral camera motion, realistic, no text",
+      "on_screen_text": "THE INVISIBLE LEAK",
+      "native_audio": "mute"
+    },
+    {
+      "id": "compounding",
+      "role": "broll",
+      "duration_s": 5,
+      "narration": "Across a week, a few missed opportunities can become thousands in unrealised revenue.",
+      "visual_prompt": "LTX-2.3 visual metaphor of individual incoming leads fading away across a working week, premium documentary style, restrained motion graphics integrated into a real office environment, no readable text",
+      "on_screen_text": "IT COMPOUNDS",
+      "native_audio": "mute"
+    },
+    {
+      "id": "response",
+      "role": "demo",
+      "provider": "gemini",
+      "duration_s": 5,
+      "narration": "A fast automated response can qualify the lead and recover the conversation in seconds.",
+      "visual_prompt": "Premium product-demo style sequence showing an incoming call becoming an immediate helpful text response and a confirmed booking, believable mobile interface without logos or readable private data, synchronized notification sounds",
+      "on_screen_text": "RESPOND IN SECONDS",
+      "native_audio": "duck"
+    },
+    {
+      "id": "handoff",
+      "role": "broll",
+      "duration_s": 5,
+      "narration": "The owner receives the context, not another task, and takes over only when needed.",
+      "visual_prompt": "LTX-2.3 cinematic business owner receiving a concise lead summary while working, calm confident reaction, authentic New Zealand small business setting, clean composition, no text",
+      "on_screen_text": "CONTEXT, NOT ADMIN",
+      "native_audio": "mute"
+    },
+    {
+      "id": "cta",
+      "role": "cta",
+      "provider": "gemini",
+      "duration_s": 5,
+      "narration": "Measure the calls you miss, then build the smallest workflow that recovers them.",
+      "visual_prompt": "Confident cinematic closing image of a service business phone dashboard turning from missed opportunities to confirmed jobs, premium restrained lighting, clean negative space for a call to action, synchronized positive resolution sound",
+      "on_screen_text": "RECOVER THE NEXT JOB",
+      "native_audio": "duck"
+    }
+  ]
+}
