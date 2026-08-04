@@ -389,7 +389,7 @@ export async function insertYouTubeCaptions(
 function packageFiles(packageDir) {
   return {
     video: join(packageDir, "video.mp4"),
-    thumbnail: join(packageDir, "thumbnail.png"),
+    thumbnail: join(packageDir, "thumbnail.jpg"),
     captions: join(packageDir, "captions.srt"),
     metadata: join(packageDir, "metadata.json"),
   };
