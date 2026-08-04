@@ -46,9 +46,13 @@ node <SKILL_DIR>/scripts/resolve.mjs \
   --type video --provider gemini --intent "A premium product reveal" --project .
 ```
 
-Only `16:9` and `9:16` are accepted. Gemini Omni's generated MP4 already carries
-native audio. Keep that track unless the composition deliberately replaces it;
-separate TTS is for controlled copy, narration voices, or caption timing.
+Only `16:9` and `9:16` are accepted. The provider requests URI delivery, polls
+the authenticated Gemini Files API until the asset is active, and then downloads
+the MP4. This avoids the inline-response size limit while retaining inline-base64
+compatibility for smaller or mocked responses. Gemini Omni's generated MP4
+already carries native audio. Keep that track unless the composition deliberately
+replaces it; separate TTS is for controlled copy, narration voices, or caption
+timing.
 
 ### Generate narration with Gemini 3.1 Flash TTS
 
