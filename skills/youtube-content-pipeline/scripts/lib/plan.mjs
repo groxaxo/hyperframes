@@ -2,8 +2,14 @@ import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 
 export const PLAN_VERSION = 1;
-export const PROVIDERS = new Set(["gemini", "comfyui"]);
-export const PROVIDER_POLICIES = new Set(["hybrid", "gemini", "comfyui"]);
+export const PROVIDERS = new Set(["gemini", "comfyui", "minimax"]);
+export const PROVIDER_POLICIES = new Set([
+  "hybrid",
+  "tri-hybrid",
+  "gemini",
+  "comfyui",
+  "minimax",
+]);
 export const FORMATS = new Set(["long", "short"]);
 export const PRIVACY_VALUES = new Set(["private", "unlisted", "public"]);
 export const DEFAULT_NEGATIVE_PROMPT =
@@ -126,20 +132,27 @@ function normalizeProduction(raw) {
 
 function initialProvider(scene, policy, index) {
   if (PROVIDERS.has(scene.provider)) return scene.provider;
-  if (policy === "gemini" || policy === "comfyui") return policy;
+  if (["gemini", "comfyui", "minimax"].includes(policy)) return policy;
   if (ROLE_GEMINI.has(scene.role)) return "gemini";
+  if (policy === "tri-hybrid") return index % 2 === 0 ? "minimax" : "comfyui";
   return index === 0 ? "gemini" : "comfyui";
 }
 
-function ensureHybridProviders(scenes) {
-  if (scenes.length < 2) return scenes;
-  const hasGemini = scenes.some((scene) => scene.provider === "gemini");
-  const hasComfy = scenes.some((scene) => scene.provider === "comfyui");
+function ensureRequiredProviders(scenes, required) {
+  if (scenes.length < required.length) return scenes;
   const result = scenes.map((scene) => ({ ...scene }));
-  if (!hasGemini) result[0].provider = "gemini";
-  if (!hasComfy) {
-    const target = result.findIndex((scene, index) => index > 0 && !scene.provider_explicit);
-    result[target >= 0 ? target : result.length - 1].provider = "comfyui";
+  for (const provider of required) {
+    if (result.some((scene) => scene.provider === provider)) continue;
+    const target = result.findIndex(
+      (scene, index) =>
+        !scene.provider_explicit &&
+        !ROLE_GEMINI.has(scene.role) &&
+        index > 0 &&
+        !required.every((candidate) => result.some((entry) => entry.provider === candidate)),
+    );
+    const fallback = result.findIndex((scene) => !scene.provider_explicit);
+    const selected = target >= 0 ? target : fallback;
+    if (selected >= 0) result[selected].provider = provider;
   }
   return result;
 }
@@ -170,7 +183,12 @@ function normalizeScenes(raw, production) {
         : null,
     };
   });
-  if (production.provider_policy === "hybrid") scenes = ensureHybridProviders(scenes);
+  if (production.provider_policy === "hybrid") {
+    scenes = ensureRequiredProviders(scenes, ["gemini", "comfyui"]);
+  }
+  if (production.provider_policy === "tri-hybrid") {
+    scenes = ensureRequiredProviders(scenes, ["gemini", "comfyui", "minimax"]);
+  }
   return scenes.map(({ provider_explicit: _private, ...scene }) => scene);
 }
 
@@ -199,6 +217,20 @@ function validateDimensions(plan, errors) {
     errors.push("short-form videos must be square or vertical (height >= width)");
 }
 
+function validateProviderCoverage(plan, errors) {
+  const required =
+    plan.production.provider_policy === "tri-hybrid"
+      ? ["gemini", "comfyui", "minimax"]
+      : plan.production.provider_policy === "hybrid"
+        ? ["gemini", "comfyui"]
+        : [];
+  for (const provider of required) {
+    if (!plan.scenes.some((scene) => scene.provider === provider)) {
+      errors.push(`${plan.production.provider_policy} production requires at least one ${provider} scene`);
+    }
+  }
+}
+
 function validateScenes(plan, errors, warnings) {
   if (plan.scenes.length === 0) errors.push("at least one scene is required");
   const ids = new Set();
@@ -208,9 +240,15 @@ function validateScenes(plan, errors, warnings) {
     if (ids.has(scene.id)) errors.push(`${prefix}.id duplicates ${scene.id}`);
     ids.add(scene.id);
     if (!scene.visual_prompt) errors.push(`${prefix}.visual_prompt is required`);
-    if (!PROVIDERS.has(scene.provider)) errors.push(`${prefix}.provider must be gemini or comfyui`);
+    if (!PROVIDERS.has(scene.provider))
+      errors.push(`${prefix}.provider must be gemini, comfyui, or minimax`);
     if (scene.fallback_provider === scene.provider)
       errors.push(`${prefix}.fallback_provider must differ from provider`);
+    if (scene.provider === "minimax" && (scene.duration_s < 4 || scene.duration_s > 15)) {
+      warnings.push(
+        `${prefix}.duration_s is outside MiniMax-H3's 4-15 second generation window; the source clip will be trimmed or padded during composition`,
+      );
+    }
     const estimatedWords = Math.floor(
       (scene.duration_s * plan.production.words_per_minute) / 60,
     );
@@ -221,13 +259,7 @@ function validateScenes(plan, errors, warnings) {
       );
     }
   }
-
-  if (plan.production.provider_policy === "hybrid" && plan.scenes.length >= 2) {
-    if (!plan.scenes.some((scene) => scene.provider === "gemini"))
-      errors.push("hybrid production requires at least one Gemini scene");
-    if (!plan.scenes.some((scene) => scene.provider === "comfyui"))
-      errors.push("hybrid production requires at least one ComfyUI scene");
-  }
+  validateProviderCoverage(plan, errors);
 }
 
 export function normalizePlan(raw) {
@@ -235,7 +267,7 @@ export function normalizePlan(raw) {
   const topic = string(root.topic);
   const format = FORMATS.has(object(root.video).format) ? object(root.video).format : "long";
   const production = normalizeProduction(root.production);
-  const plan = {
+  return {
     version: PLAN_VERSION,
     topic,
     channel: {
@@ -246,7 +278,6 @@ export function normalizePlan(raw) {
     production,
     scenes: normalizeScenes(root.scenes, production),
   };
-  return plan;
 }
 
 export function validatePlan(raw, { throwOnError = true } = {}) {
