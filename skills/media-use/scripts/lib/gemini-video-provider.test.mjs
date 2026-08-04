@@ -49,6 +49,7 @@ test("geminiVideoGenerate writes Omni's MP4 and returns resolver metadata", asyn
     assert.deepEqual(request.body.response_format, {
       type: "video",
       aspect_ratio: "9:16",
+      delivery: "uri",
     });
     assert.equal(request.body.background, false);
     assert.equal(request.body.store, false);
@@ -56,6 +57,7 @@ test("geminiVideoGenerate writes Omni's MP4 and returns resolver metadata", asyn
     assert.equal(request.options.apiKey, "test-key");
     assert.equal(result.ext, ".mp4");
     assert.equal(result.metadata.provider, "gemini.omni");
+    assert.equal(result.metadata.provenance.delivery, "uri");
     assert.equal(result.metadata.provenance.native_audio, true);
     assert.equal(result.metadata.provenance.aspect_ratio, "9:16");
     assert.equal(existsSync(result.localPath), true);
