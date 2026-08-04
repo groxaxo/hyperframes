@@ -98,16 +98,16 @@ function parseCli(argv) {
 }
 
 function helpText() {
-  return `YouTube hybrid content pipeline
+  return `YouTube multi-provider content pipeline
 
 Usage:
   node youtube-pipeline.mjs <command> --project <dir> [options]
 
 Commands:
   init        Create youtube-plan.json and project notes
-  preflight   Check Gemini, ComfyUI workflow, FFmpeg, Node and optional YouTube OAuth
+  preflight   Check required providers, FFmpeg, Node and optional YouTube OAuth
   validate    Validate and normalize the production plan
-  visuals     Generate/resume Gemini + ComfyUI scene assets
+  visuals     Generate/resume Gemini, ComfyUI, and/or MiniMax scene assets
   audio       Generate Gemini 3.1 Flash TTS and caption timings
   compose     Build the editable HyperFrames project, captions and thumbnail project
   render      Run hyperframes check, render high quality, and verify the MP4
@@ -541,12 +541,38 @@ function binaryCheck(name, args = ["--version"]) {
   };
 }
 
-function preflight(projectDir) {
+function providerRequirements(projectDir) {
+  const planPath = join(projectDir, "youtube-plan.json");
+  let plan = null;
+  if (existsSync(planPath)) {
+    try {
+      plan = readPlan(planPath).plan;
+    } catch {
+      // Validation reports plan errors. Preflight falls back to the default
+      // hybrid requirements rather than hiding environment blockers.
+    }
+  }
+  const policy = plan?.production?.provider_policy || "hybrid";
+  const sceneProviders = new Set(plan?.scenes?.map((scene) => scene.provider) || []);
+  const hasNarration = plan ? plan.scenes.some((scene) => scene.narration) : true;
+  return {
+    policy,
+    gemini: hasNarration || sceneProviders.has("gemini") || policy === "hybrid" || policy === "tri-hybrid",
+    comfyui: sceneProviders.has("comfyui") || policy === "hybrid" || policy === "tri-hybrid" || policy === "comfyui",
+    minimax: sceneProviders.has("minimax") || policy === "tri-hybrid" || policy === "minimax",
+  };
+}
+
+export function preflight(projectDir) {
   loadEnvFromDir(projectDir);
+  const required = providerRequirements(projectDir);
   const workflowRaw = process.env.COMFYUI_LTX23_WORKFLOW || process.env.COMFYUI_LTX_WORKFLOW;
   const workflow = workflowRaw
     ? (workflowRaw.startsWith("/") ? workflowRaw : resolve(projectDir, workflowRaw))
     : null;
+  const geminiReady = Boolean(process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY);
+  const comfyReady = Boolean(workflow && existsSync(workflow));
+  const minimaxReady = Boolean(process.env.MINIMAX_API_KEY);
   const checks = [
     {
       name: "Node.js 22+",
@@ -558,18 +584,29 @@ function preflight(projectDir) {
     binaryCheck(process.platform === "win32" ? "npx.cmd" : "npx", ["hyperframes", "--version"]),
     {
       name: "Gemini API key",
-      ok: Boolean(process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY),
-      detail: process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY ? "configured" : "set GEMINI_API_KEY",
+      ok: geminiReady,
+      optional: !required.gemini,
+      detail: geminiReady ? "configured" : "set GEMINI_API_KEY",
     },
     {
       name: "ComfyUI LTX-2.3 workflow",
-      ok: Boolean(workflow && existsSync(workflow)),
+      ok: comfyReady,
+      optional: !required.comfyui,
       detail: workflow ? (existsSync(workflow) ? workflow : `not found: ${workflow}`) : "set COMFYUI_LTX23_WORKFLOW",
     },
     {
       name: "ComfyUI URL",
       ok: true,
+      optional: !required.comfyui,
       detail: process.env.COMFYUI_URL || "http://127.0.0.1:8188",
+    },
+    {
+      name: "MiniMax-H3 API key",
+      ok: minimaxReady,
+      optional: !required.minimax,
+      detail: minimaxReady
+        ? `configured (${process.env.MINIMAX_API_HOST || "global"})`
+        : "set MINIMAX_API_KEY for minimax or tri-hybrid plans",
     },
   ];
   const youtube = youtubeCredentialStatus(process.env);
@@ -581,6 +618,7 @@ function preflight(projectDir) {
   });
   return {
     ok: checks.filter((check) => !check.optional).every((check) => check.ok),
+    provider_policy: required.policy,
     checks,
   };
 }
