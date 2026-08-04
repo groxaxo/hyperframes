@@ -4,9 +4,11 @@ import {
   GEMINI_INTERACTIONS_ENDPOINT,
   createGeminiInteraction,
   decodeGeminiMedia,
+  geminiFileId,
   findGeminiMedia,
   geminiApiKey,
   isWavBuffer,
+  readGeminiMedia,
   pcm16leToWav,
 } from "./gemini-api.mjs";
 
@@ -43,6 +45,61 @@ test("decodeGeminiMedia rejects missing data and decodes base64 bytes", () => {
   assert.equal(bytes.toString(), "mp4");
   assert.throws(() => decodeGeminiMedia({ uri: "files/123" }, "video"), /no inline video data/);
   assert.throws(() => decodeGeminiMedia({ data: "%" }, "audio"), /invalid base64 audio/);
+});
+
+test("geminiFileId accepts canonical file URIs and rejects malformed IDs", () => {
+  assert.equal(geminiFileId("files/video-123"), "video-123");
+  assert.equal(
+    geminiFileId(
+      "https://generativelanguage.googleapis.com/v1beta/files/video_123:download?alt=media",
+    ),
+    "video_123",
+  );
+  assert.throws(() => geminiFileId("https://example.com/not-a-file"), /invalid file URI/);
+});
+
+test("readGeminiMedia polls URI delivery until ACTIVE and downloads the video", async () => {
+  const calls = [];
+  const sleeps = [];
+  const video = Buffer.from("uri-delivered-video");
+  const responses = [
+    { ok: true, json: async () => ({ state: "PROCESSING" }) },
+    { ok: true, json: async () => ({ state: "ACTIVE" }) },
+    {
+      ok: true,
+      arrayBuffer: async () =>
+        video.buffer.slice(video.byteOffset, video.byteOffset + video.byteLength),
+    },
+  ];
+  const bytes = await readGeminiMedia(
+    {
+      uri: "https://generativelanguage.googleapis.com/v1beta/files/video-123:download?alt=media",
+    },
+    "video",
+    {
+      apiKey: "secret",
+      retries: 0,
+      pollIntervalMs: 1,
+      sleep: async (ms) => sleeps.push(ms),
+      fetch: async (url, options) => {
+        calls.push({ url, options });
+        return responses.shift();
+      },
+    },
+  );
+
+  assert.deepEqual(bytes, video);
+  assert.equal(calls.length, 3);
+  assert.equal(
+    calls[0].url,
+    "https://generativelanguage.googleapis.com/v1beta/files/video-123",
+  );
+  assert.equal(calls[0].options.headers["x-goog-api-key"], "secret");
+  assert.equal(
+    calls[2].url,
+    "https://generativelanguage.googleapis.com/v1beta/files/video-123:download?alt=media",
+  );
+  assert.deepEqual(sleeps, [1]);
 });
 
 test("pcm16leToWav writes a valid 24 kHz mono PCM WAV header", () => {
