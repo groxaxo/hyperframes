@@ -3,22 +3,22 @@
 // Each media type maps to an ORDERED list of provider entries. Providers are
 // tried in order; the first to return a non-null result wins, which keeps
 // resolution deterministic (same request -> same provider -> same file ->
-// reproducible renders). heygen-CLI is always first for the types it serves.
+// reproducible renders). For video and TTS, Gemini is preferred when a Google
+// API key is present; its provider returns null when unconfigured so the
+// established HeyGen and local fallbacks remain intact.
 //
 // An entry exposes any of three capability methods — search / generate /
-// process — plus { name }. media-use holds no keys; each external tool owns its
-// own auth. Providers, by type:
-//   - heygen CLI: catalog + TTS, first for every type it serves (OAuth free
-//     allowance first, then the user's HeyGen billing path)
+// process — plus { name }. media-use holds no keys; each external service owns
+// its auth and media-use reads credentials from its normal environment.
+// Providers, by type:
+//   - Gemini: Omni Flash video with native audio and Gemini 3.1 Flash TTS
+//   - heygen CLI: catalog + TTS + avatar video
 //   - mflux: local FLUX-class image gen, spec-selected to the machine's RAM
-//     (free, private, offline once cached)
-//   - codex CLI: image gen on the user's ChatGPT sub — the better-quality upsell
-//     and the fallback when no local model fits
-//   - Kokoro (via the hyperframes CLI): local voiceover, free/private fallback
-//     when HeyGen credentials are absent or --local-only is requested
+//   - codex CLI: image gen on the user's ChatGPT sub
+//   - Kokoro / LTX: local voice and video fallbacks
 //
-// Generation is local-first, cloud-upsell. `ctx.provider` forces one provider
-// (e.g. "make an image with codex").
+// Generation is cloud-preferred where configured, with local fallbacks.
+// `ctx.provider` forces one provider (e.g. "make a video with gemini").
 
 import { bgmProvider } from "./bgm-provider.mjs";
 import { sfxProvider } from "./sfx-provider.mjs";
@@ -31,6 +31,8 @@ import {
   githubAvatarSearch,
   faviconSearch,
 } from "./logo-provider.mjs";
+import { geminiTtsGenerate } from "./gemini-tts-provider.mjs";
+import { geminiVideoGenerate } from "./gemini-video-provider.mjs";
 import { heygenTtsGenerate } from "./voice-provider.mjs";
 import { heygenVideoGenerate } from "./heygen-video-provider.mjs";
 import { ltxVideoGenerate } from "./ltx-video-provider.mjs";
@@ -39,15 +41,13 @@ import { codexImageGenerate } from "./codex-provider.mjs";
 import { mfluxImageGenerate } from "./mflux-provider.mjs";
 
 // Provider markers: `network` = hits a remote service (skipped by --local-only).
-// `paid` = may cost wallet credits after any OAuth/web-plan free allowance
-// (documentation for the agent's cost judgment, X4: agent-initiated paid should
-// confirm). HeyGen catalog SEARCH is free; HeyGen TTS is free for eligible
-// OAuth CLI users up to the monthly allowance, then follows the user's billing.
+// `paid` = can consume metered credits. A user-requested call runs; an
+// agent-initiated paid call follows the media-use cost-confirmation rule.
 const A = (name, caps) => ({ name, ...caps }); // local, free
 const N = (name, caps) => ({ name, network: true, ...caps }); // remote, free
 const P = (name, caps) => ({ name, network: true, paid: true, ...caps }); // remote, paid
 
-// heygen-CLI first. All remote providers are skipped by --local-only.
+// Remote providers are skipped by --local-only.
 const REGISTRY = {
   bgm: [N("heygen.audio.sounds", { search: bgmProvider.search })],
   sfx: [
@@ -75,19 +75,17 @@ const REGISTRY = {
     N("favicon.ddg", { search: faviconSearch }),
   ],
   voice: [
-    // HeyGen TTS first when credentialed so CLI/OAuth users consume the free
-    // web-plan allowance (10 min/month) before any paid path. --local-only skips
-    // it and keeps Kokoro as the private/offline fallback.
-    // Deliberately kept `paid` (X4 confirm-before-call) even though the first
-    // 10 min/month are free: the client can't know the remaining allowance, so
-    // confirming is safer than risking a silent charge once it's spent. (A
-    // tri-state "quota-first, paid after" would need backend quota state.)
+    // Gemini 3.1 Flash TTS is preferred when GEMINI_API_KEY / GOOGLE_API_KEY is
+    // configured. The provider returns null without a key, allowing the existing
+    // HeyGen path and private Kokoro fallback to continue unchanged.
+    P("gemini.tts", { generate: geminiTtsGenerate }),
     P("heygen.tts", { generate: heygenTtsGenerate }),
     A("kokoro.local", { generate: localTtsGenerate }),
   ],
   video: [
-    // HeyGen avatar video first when credentialed; --local-only skips it and
-    // keeps LTX as the local fallback.
+    // Gemini Omni generates general-purpose video with a native audio track.
+    // HeyGen remains the avatar-video fallback; LTX remains fully local.
+    P("gemini.omni", { generate: geminiVideoGenerate }),
     P("heygen.video", { generate: heygenVideoGenerate }),
     A("ltx.local", { generate: ltxVideoGenerate }),
   ],
@@ -128,8 +126,8 @@ export function providerNamesFor(type) {
 }
 
 /**
- * Does an override token (full name like "codex.image_gen" or a prefix like
- * "codex") match any provider declared for the type? Same match rule as
+ * Does an override token (full name like "gemini.omni" or a prefix like
+ * "gemini") match any provider declared for the type? Same match rule as
  * runProviders, so validation and dispatch never disagree.
  */
 export function providerMatches(type, want) {
@@ -156,10 +154,8 @@ export function getProvider(type) {
  * safety flag: it must never make a network call. Forcing a network provider
  * while offline yields a clean miss (the caller explains the conflict), never a
  * silent network request.
- * Provider override: `ctx.provider` (a full name like "codex.image_gen" or a
- * prefix like "codex") pins resolution to matching providers only — this is how
- * a user "make an image WITH codex" forces the upsell instead of taking the
- * free-first default.
+ * Provider override: `ctx.provider` (a full name like "gemini.omni" or a prefix
+ * like "gemini") pins resolution to matching providers only.
  */
 export async function runProviders(providers, capability, intent, ctx) {
   const want = ctx?.provider;
@@ -174,7 +170,7 @@ export async function runProviders(providers, capability, intent, ctx) {
   return null;
 }
 
-/** Run a capability over the providers for a type (deterministic, heygen-first). */
+/** Run a capability over the providers for a type (deterministic order). */
 export async function runCapability(type, capability, intent, ctx) {
   return runProviders(getProviders(type), capability, intent, ctx);
 }
