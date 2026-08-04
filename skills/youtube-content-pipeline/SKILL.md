@@ -149,7 +149,7 @@ The composer:
 - mounts each generated video muted, with optional separate native audio;
 - places editorial text independently from captions;
 - adds restrained deterministic transitions;
-- creates `thumbnail.html` at 1280×720;
+- creates a 1280×720 `thumbnail-project/` for deterministic snapshot rendering;
 - writes a YouTube metadata manifest and chapter timestamps.
 
 The result remains an ordinary HyperFrames project and can be edited manually.
@@ -172,8 +172,8 @@ node <SKILL_DIR>/scripts/youtube-pipeline.mjs render \
 ```
 
 The command runs the required check, renders high quality, verifies a non-empty
-file and plausible duration, and writes the result under
-`youtube-package/video.mp4`.
+file and plausible duration, and writes the verified intermediate to
+`.youtube-pipeline/final-render.mp4`. Stage 6 copies it into the release package.
 
 ## Stage 6 — package
 
@@ -187,7 +187,7 @@ The package contains:
 ```text
 youtube-package/
   video.mp4
-  thumbnail.png
+  thumbnail.jpg
   captions.srt
   captions.vtt
   metadata.json
