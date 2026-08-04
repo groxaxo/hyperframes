@@ -12,6 +12,7 @@ import {
   readState,
   stageIsCurrent,
   writeState,
+  STAGES,
 } from "./state.mjs";
 
 test("stage lifecycle is resumable and input-hash aware", () => {
@@ -49,4 +50,8 @@ test("state writes atomically with private file permissions", () => {
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test("stage order keeps render between compose and package", () => {
+  assert.deepEqual(STAGES, ["plan", "visuals", "audio", "compose", "render", "package", "publish"]);
 });

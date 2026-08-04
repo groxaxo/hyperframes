@@ -2,7 +2,7 @@ import { mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node
 import { dirname } from "node:path";
 
 export const PIPELINE_STATE_VERSION = 1;
-export const STAGES = ["plan", "visuals", "audio", "compose", "package", "publish"];
+export const STAGES = ["plan", "visuals", "audio", "compose", "render", "package", "publish"];
 
 export function emptyState(planHash = null) {
   return {
