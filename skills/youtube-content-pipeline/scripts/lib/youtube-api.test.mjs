@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -155,7 +155,7 @@ test("dry-run publishing validates a complete package without network access", a
   try {
     for (const [name, data] of [
       ["video.mp4", "video"],
-      ["thumbnail.png", "thumb"],
+      ["thumbnail.jpg", "thumb"],
       ["captions.srt", "captions"],
       ["metadata.json", "{}"],
     ]) writeFileSync(join(dir, name), data);
