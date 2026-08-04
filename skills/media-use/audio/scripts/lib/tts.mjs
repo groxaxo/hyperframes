@@ -1,26 +1,36 @@
 // tts.mjs — multi-provider TTS for the media audio engine. The provider chain,
 // auto-detected from env, is the one documented in ../SKILL.md:
 //
-//   1. HeyGen (Starfish)  — $HEYGEN_API_KEY / $HYPERFRAMES_API_KEY / ~/.heygen.
+//   1. Gemini 3.1 Flash TTS — $GEMINI_API_KEY / $GOOGLE_API_KEY.
+//        Native 24 kHz mono PCM is wrapped locally as WAV. No word timestamps,
+//        so the caller chains transcribeWav().
+//   2. HeyGen (Starfish)  — $HEYGEN_API_KEY / $HYPERFRAMES_API_KEY / ~/.heygen.
 //        Direct v3 REST (NOT `hyperframes tts`, which in the published build is
 //        Kokoro-only and silently ignores a HeyGen key). Returns word_timestamps
 //        in the same call, so no separate transcribe pass.
-//   2. ElevenLabs         — $ELEVENLABS_API_KEY + `pip install elevenlabs`. No
+//   3. ElevenLabs         — $ELEVENLABS_API_KEY + `pip install elevenlabs`. No
 //        word timings → caller chains transcribeWav().
-//   3. Kokoro-82M (local) — always available, via the published `hyperframes tts`
+//   4. Kokoro-82M (local) — always available, via the published `hyperframes tts`
 //        CLI. No word timings → caller chains transcribeWav().
 //
-// "HeyGen available" is decided by CREDENTIAL presence (heygenCredential), never
-// by the CLI — see the note above.
+// Provider availability is decided by credential presence, not by a cloud CLI.
 
 import { spawn, spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+import {
+  DEFAULT_GEMINI_TTS_VOICE,
+  generateGeminiTtsWav,
+} from "../../../scripts/lib/gemini-tts-provider.mjs";
+import { geminiApiKey } from "../../../scripts/lib/gemini-api.mjs";
 import { heygenAuthHeaders, heygenCredential, heygenJSON } from "./heygen.mjs";
 import { pythonInvocation } from "./python.mjs";
 
 // ── provider detection ────────────────────────────────────────────────────────
+export function geminiAvailable() {
+  return geminiApiKey() !== null;
+}
 export function heygenAvailable() {
   return heygenCredential() !== null;
 }
@@ -36,8 +46,16 @@ export function elevenlabsAvailable() {
 // First available provider wins; an explicit choice is honored (and validated).
 export function pickProvider(userProvider) {
   if (userProvider) {
-    if (!["heygen", "elevenlabs", "kokoro"].includes(userProvider))
-      throw new Error(`invalid provider "${userProvider}" (heygen | elevenlabs | kokoro)`);
+    if (!["gemini", "heygen", "elevenlabs", "kokoro"].includes(userProvider)) {
+      throw new Error(
+        `invalid provider "${userProvider}" (gemini | heygen | elevenlabs | kokoro)`,
+      );
+    }
+    if (userProvider === "gemini" && !geminiAvailable()) {
+      throw new Error(
+        "provider=gemini but no Google API key (set $GEMINI_API_KEY or $GOOGLE_API_KEY)",
+      );
+    }
     if (userProvider === "heygen" && !heygenAvailable())
       throw new Error(
         "provider=heygen but no HeyGen credentials (set $HEYGEN_API_KEY or run `npx hyperframes auth login`)",
@@ -46,15 +64,21 @@ export function pickProvider(userProvider) {
       throw new Error("provider=elevenlabs but $ELEVENLABS_API_KEY is not set");
     return userProvider;
   }
-  return heygenAvailable() ? "heygen" : elevenlabsAvailable() ? "elevenlabs" : "kokoro";
+  return geminiAvailable()
+    ? "gemini"
+    : heygenAvailable()
+      ? "heygen"
+      : elevenlabsAvailable()
+        ? "elevenlabs"
+        : "kokoro";
 }
 
 // ── voice resolution ──────────────────────────────────────────────────────────
-// HeyGen /v3/voices/speech only accepts STARFISH voice_ids; auto-pick the first
-// English public starfish voice when none is pinned. ElevenLabs/Kokoro have
-// their own defaults.
+// Gemini uses named prebuilt voices, HeyGen uses STARFISH UUIDs, and the other
+// providers retain their own deterministic defaults.
 export async function resolveVoiceId({ provider, userVoice, lang = "en" }) {
   if (userVoice) return userVoice;
+  if (provider === "gemini") return process.env.GEMINI_TTS_VOICE || DEFAULT_GEMINI_TTS_VOICE;
   if (provider === "elevenlabs") return "21m00Tcm4TlvDq8ikWAM"; // Rachel
   if (provider === "kokoro") {
     if (lang === "en") return "am_michael";
@@ -238,9 +262,9 @@ save(audio, sys.argv[3])
 
 // ── synthesize one line ───────────────────────────────────────────────────────
 // Writes wav at wavAbs. Returns { ok, words, error } — words is the raw
-// [{text,start,end}] array for HeyGen (native), or null for ElevenLabs/Kokoro
-// (caller must transcribeWav). Never throws; failures return { ok:false, error }
-// where `error` states WHY (so the caller can surface it, not a bare "TTS failed").
+// [{text,start,end}] array for HeyGen (native), or null for Gemini,
+// ElevenLabs/Kokoro (caller must transcribeWav). Never throws; failures return
+// { ok:false, error } where `error` states WHY.
 export async function synthesizeOne({
   provider,
   text,
@@ -250,6 +274,9 @@ export async function synthesizeOne({
   wavAbs,
   hyperframesDir,
 }) {
+  if (provider === "gemini") {
+    return synthesizeGemini({ text, voiceId, lang, speed, wavAbs });
+  }
   if (provider === "heygen") return synthesizeHeygen({ text, voiceId, lang, speed, wavAbs });
   if (provider === "elevenlabs") {
     // The Python helper writes straight to wavAbs; unlike heygen (transcodeToWav)
@@ -280,6 +307,35 @@ export async function synthesizeOne({
   if (lang !== "en") args.push("--lang", lang);
   const r = await spawnP("npx", args, { cwd: hyperframesDir });
   return synthResult(r, wavAbs, "kokoro (npx hyperframes tts)");
+}
+
+export async function synthesizeGemini({ text, voiceId, speed, wavAbs }, deps = {}) {
+  const generate = deps.generateGeminiTtsWav ?? generateGeminiTtsWav;
+  try {
+    await generate(
+      {
+        text,
+        voice: voiceId || DEFAULT_GEMINI_TTS_VOICE,
+        speed,
+        outputPath: wavAbs,
+      },
+      deps.providerDeps,
+    );
+    if (!existsSync(wavAbs)) {
+      return {
+        ok: false,
+        words: null,
+        error: "Gemini 3.1 Flash TTS produced no wav file",
+      };
+    }
+    return { ok: true, words: null };
+  } catch (error) {
+    return {
+      ok: false,
+      words: null,
+      error: error?.message ? String(error.message) : String(error),
+    };
+  }
 }
 
 // Shape a spawn result into { ok, words, error }, naming why on failure so the
@@ -343,9 +399,9 @@ export async function synthesizeHeygen({ text, voiceId, lang, speed, wavAbs }, d
   }
 }
 
-// ElevenLabs/Kokoro have no word timings — run Whisper over the wav. Returns the
-// flat [{id,text,start,end}] word array, or null. Each call uses a throwaway
-// --dir so parallel scenes don't collide on transcript.json.
+// Gemini, ElevenLabs, and Kokoro have no word timings — run Whisper over the
+// wav. Returns the flat [{id,text,start,end}] word array, or null. Each call uses
+// a throwaway --dir so parallel scenes don't collide on transcript.json.
 export async function transcribeWav({ wavRel, lang = "en", hyperframesDir }) {
   const model = lang === "en" ? "small.en" : "small";
   const td = mkdtempSync(join(tmpdir(), "hf-trans-"));
