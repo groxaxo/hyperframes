@@ -1,7 +1,7 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { spawnSync as nodeSpawnSync } from "node:child_process";
+import { execFile as nodeExecFile, spawnSync as nodeSpawnSync } from "node:child_process";
 import { stableHash } from "./plan.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -40,48 +40,45 @@ export function runNodeJson(
     cwd,
     env = process.env,
     timeoutMs = 7_200_000,
-    spawnSync = nodeSpawnSync,
+    maxBuffer = 16 * 1024 * 1024,
+    execFile = nodeExecFile,
   } = {},
 ) {
-  const result = spawnSync(process.execPath, [script, ...args], {
-    cwd,
-    env,
-    encoding: "utf8",
-    timeout: timeoutMs,
-    maxBuffer: 16 * 1024 * 1024,
-  });
-  if (result.error) {
-    throw new PipelineCommandError(`${script} failed to start: ${result.error.message}`, {
-      status: result.status,
-      stdout: result.stdout,
-      stderr: result.stderr,
-    });
-  }
-  const payload = parseJsonOutput(result.stdout);
-  if (result.status !== 0 || payload?.ok === false) {
-    const detail = payload?.error || String(result.stderr || result.stdout || "").trim();
-    throw new PipelineCommandError(
-      `${script} exited with status ${result.status}${detail ? ` — ${detail}` : ""}`,
-      {
-        status: result.status,
-        stdout: result.stdout,
-        stderr: result.stderr,
+  return new Promise((resolvePromise, reject) => {
+    execFile(
+      process.execPath,
+      [script, ...args],
+      { cwd, env, encoding: "utf8", timeout: timeoutMs, maxBuffer, windowsHide: true },
+      (error, stdout = "", stderr = "") => {
+        const payload = parseJsonOutput(stdout);
+        const status = error && Number.isInteger(error.code) ? error.code : error ? null : 0;
+        if (error || payload?.ok === false) {
+          const detail = payload?.error || String(stderr || stdout || error?.message || "").trim();
+          reject(
+            new PipelineCommandError(
+              `${script} exited${status != null ? ` with status ${status}` : ""}${detail ? ` — ${detail}` : ""}`,
+              { status, stdout, stderr },
+            ),
+          );
+          return;
+        }
+        if (!payload) {
+          reject(new PipelineCommandError(`${script} returned no JSON payload`, { status, stdout, stderr }));
+          return;
+        }
+        resolvePromise(payload);
       },
     );
-  }
-  if (!payload) {
-    throw new PipelineCommandError(`${script} returned no JSON payload`, {
-      status: result.status,
-      stdout: result.stdout,
-      stderr: result.stderr,
-    });
-  }
-  return payload;
+  });
 }
 
 export function ltxFramesForDuration(durationS, fps = 24) {
   const target = Math.max(9, Math.ceil(Number(durationS) * fps));
   return Math.ceil((target - 1) / 8) * 8 + 1;
+}
+
+export function miniMaxDurationForScene(durationS) {
+  return Math.max(4, Math.min(15, Math.round(Number(durationS) || 5)));
 }
 
 export function sceneGenerationIntent(plan, scene) {
@@ -98,10 +95,12 @@ export function sceneGenerationIntent(plan, scene) {
     .join(" ");
 }
 
-export function sceneProviderEnv(plan, scene, baseEnv = process.env) {
+export function sceneProviderEnv(plan, scene, baseEnv = process.env, { workerSlot = 0 } = {}) {
   const env = { ...baseEnv };
   if (scene.provider === "comfyui") {
     const fps = 24;
+    const workers = comfyUiWorkerUrls(baseEnv);
+    env.COMFYUI_URL = workers[Math.abs(workerSlot) % workers.length];
     env.COMFYUI_LTX23_FRAMES = String(ltxFramesForDuration(scene.duration_s, fps));
     env.COMFYUI_LTX23_FPS = String(fps);
     env.COMFYUI_LTX23_NEGATIVE_PROMPT = scene.negative_prompt;
@@ -109,13 +108,58 @@ export function sceneProviderEnv(plan, scene, baseEnv = process.env) {
   if (scene.provider === "gemini") {
     env.GEMINI_VIDEO_ASPECT_RATIO = plan.video.height > plan.video.width ? "9:16" : "16:9";
   }
+  if (scene.provider === "minimax") {
+    env.MINIMAX_H3_DURATION = String(miniMaxDurationForScene(scene.duration_s));
+    env.MINIMAX_H3_RATIO = plan.video.height > plan.video.width ? "9:16" : "16:9";
+    env.MINIMAX_H3_NEGATIVE_PROMPT = scene.negative_prompt;
+  }
   return env;
+}
+
+export function comfyUiWorkerUrls(env = process.env) {
+  let values = [];
+  if (typeof env.COMFYUI_URLS_JSON === "string" && env.COMFYUI_URLS_JSON.trim()) {
+    let parsed;
+    try {
+      parsed = JSON.parse(env.COMFYUI_URLS_JSON);
+    } catch (error) {
+      throw new Error(`COMFYUI_URLS_JSON must be a JSON array: ${error.message}`);
+    }
+    if (!Array.isArray(parsed)) throw new Error("COMFYUI_URLS_JSON must be a JSON array");
+    values = parsed;
+  } else if (typeof env.COMFYUI_URLS === "string" && env.COMFYUI_URLS.trim()) {
+    values = env.COMFYUI_URLS.split(",");
+  } else {
+    values = [env.COMFYUI_URL || "http://127.0.0.1:8188"];
+  }
+  const normalized = [];
+  for (const raw of values) {
+    if (typeof raw !== "string" || !raw.trim()) continue;
+    let url;
+    try {
+      url = new URL(raw.trim());
+    } catch {
+      throw new Error(`invalid ComfyUI worker URL: ${raw}`);
+    }
+    if (!["http:", "https:"].includes(url.protocol))
+      throw new Error(`ComfyUI worker URL must use http or https: ${raw}`);
+    if (url.username || url.password)
+      throw new Error("ComfyUI worker URLs must not embed credentials; use header environment variables");
+    url.pathname = url.pathname.replace(/\/+$/, "");
+    url.search = "";
+    url.hash = "";
+    const value = url.toString().replace(/\/$/, "");
+    if (!normalized.includes(value)) normalized.push(value);
+  }
+  if (!normalized.length) throw new Error("at least one ComfyUI worker URL is required");
+  return normalized;
 }
 
 function providerFamily(provider) {
   const value = String(provider || "");
   if (value.startsWith("gemini")) return "gemini";
   if (value.startsWith("comfyui")) return "comfyui";
+  if (value.startsWith("minimax")) return "minimax";
   return value || "unknown";
 }
 
@@ -147,6 +191,12 @@ async function mapWithConcurrency(items, concurrency, worker) {
   return results;
 }
 
+function requiredProviderFamilies(policy) {
+  if (policy === "tri-hybrid") return ["gemini", "comfyui", "minimax"];
+  if (policy === "hybrid") return ["gemini", "comfyui"];
+  return [];
+}
+
 export async function generateVisuals(
   plan,
   {
@@ -167,6 +217,10 @@ export async function generateVisuals(
     // A missing or invalid manifest is a fresh visual stage.
   }
   const records = { ...(previous.scenes || {}) };
+  const comfySceneIds = plan.scenes
+    .filter((scene) => scene.provider === "comfyui" || scene.fallback_provider === "comfyui")
+    .map((scene) => scene.id);
+  const comfyPoolSize = comfySceneIds.length ? comfyUiWorkerUrls(env).length : 0;
 
   const generated = await mapWithConcurrency(
     plan.scenes,
@@ -189,9 +243,10 @@ export async function generateVisuals(
       let lastError;
       for (const provider of providers) {
         const candidate = { ...scene, provider };
-        onProgress({ type: "start", scene: candidate, index });
+        const workerSlot = provider === "comfyui" ? Math.max(0, comfySceneIds.indexOf(scene.id)) : 0;
+        onProgress({ type: "start", scene: candidate, index, workerSlot });
         try {
-          const payload = runJson(
+          const payload = await runJson(
             resolveScript,
             [
               "--type",
@@ -206,20 +261,23 @@ export async function generateVisuals(
             ],
             {
               cwd: projectDir,
-              env: sceneProviderEnv(plan, candidate, env),
+              env: sceneProviderEnv(plan, candidate, env, { workerSlot }),
             },
           );
           if (!payload.path) throw new Error("media-use returned no frozen asset path");
-          const requestedProvider = provider;
           const actualProvider = providerFamily(payload.provenance?.provider || provider);
           const record = {
             id: scene.id,
-            requested_provider: requestedProvider,
+            requested_provider: provider,
             provider: actualProvider,
             path: payload.path,
             source_duration_s: payload.duration ?? null,
             target_duration_s: scene.duration_s,
             native_audio: scene.native_audio,
+            ...(actualProvider === "comfyui" && {
+              worker_slot: workerSlot % comfyPoolSize,
+              worker_pool_size: comfyPoolSize,
+            }),
             input_hash: inputHash,
             provenance: payload.provenance || {},
           };
@@ -233,6 +291,9 @@ export async function generateVisuals(
         } catch (error) {
           lastError = error;
           onProgress({ type: "provider-failed", scene: candidate, index, error });
+          // MiniMax errors carrying a task ID must never fall through to another
+          // provider because the paid H3 task may still complete remotely.
+          if (error?.taskId) throw error;
         }
       }
       throw new Error(
@@ -241,13 +302,14 @@ export async function generateVisuals(
     },
   );
 
-  if (plan.production.provider_policy === "hybrid" && generated.length >= 2) {
-    const families = new Set(generated.map((record) => record.provider));
-    if (!families.has("gemini") || !families.has("comfyui")) {
-      throw new Error(
-        `hybrid visual stage completed without both providers (actual: ${[...families].join(", ")})`,
-      );
-    }
+  const families = new Set(generated.map((record) => record.provider));
+  const missing = requiredProviderFamilies(plan.production.provider_policy).filter(
+    (provider) => !families.has(provider),
+  );
+  if (missing.length) {
+    throw new Error(
+      `${plan.production.provider_policy} visual stage completed without ${missing.join(", ")} (actual: ${[...families].join(", ")})`,
+    );
   }
   const manifest = { version: 1, plan_hash: stableHash(plan), scenes: records };
   writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
@@ -270,15 +332,11 @@ export function buildAudioRequest(plan) {
 }
 
 export function approximateWordTimings(text, durationS) {
-  const words = String(text || "")
-    .trim()
-    .split(/\s+/)
-    .filter(Boolean);
+  const words = String(text || "").trim().split(/\s+/).filter(Boolean);
   if (!words.length || !(durationS > 0)) return [];
   const weights = words.map((word) => Math.max(1, word.replace(/[^\p{L}\p{N}]/gu, "").length));
   const total = weights.reduce((sum, weight) => sum + weight, 0);
   let cursor = 0;
-
   return words.map((word, index) => {
     const start = cursor;
     cursor += (weights[index] / total) * durationS;
