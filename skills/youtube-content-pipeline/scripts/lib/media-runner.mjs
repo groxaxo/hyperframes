@@ -291,9 +291,11 @@ export async function generateVisuals(
         } catch (error) {
           lastError = error;
           onProgress({ type: "provider-failed", scene: candidate, index, error });
-          // MiniMax errors carrying a task ID must never fall through to another
-          // provider because the paid H3 task may still complete remotely.
-          if (error?.taskId) throw error;
+          // An H3 subprocess error may cross a JSON boundary that cannot retain
+          // the in-memory taskId property. Treat every explicit MiniMax attempt
+          // as strict: never invoke another provider after it, because a paid H3
+          // task may already exist even when the local response was interrupted.
+          if (provider === "minimax" || error?.taskId) throw error;
         }
       }
       throw new Error(
