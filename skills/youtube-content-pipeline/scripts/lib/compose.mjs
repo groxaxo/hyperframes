@@ -1,5 +1,11 @@
 import { spawnSync as nodeSpawnSync } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { join, relative, resolve } from "node:path";
 import { stableHash } from "./plan.mjs";
 
@@ -118,7 +124,6 @@ export function normalizeVisualAssets(
   visualManifest,
   {
     projectDir,
-    force = false,
     spawnSync = nodeSpawnSync,
     onProgress = () => {},
   } = {},
@@ -139,15 +144,6 @@ export function normalizeVisualAssets(
       height: plan.video.height,
       fps: plan.video.fps,
     });
-    if (!force && existsSync(outputPath)) {
-      records[scene.id] = {
-        ...source,
-        normalized_path: relative(projectDir, outputPath),
-        input_hash: inputHash,
-      };
-      onProgress({ type: "skip", scene, outputPath });
-      continue;
-    }
     onProgress({ type: "start", scene, outputPath });
     runFfmpeg(
       buildNormalizeVideoArgs({
@@ -529,7 +525,6 @@ export function composeProject(
   const schedule = buildSchedule(plan, audioMeta);
   const normalized = normalizeVisualAssets(plan, schedule, visualManifest, {
     projectDir,
-    force,
     spawnSync,
     onProgress,
   });
