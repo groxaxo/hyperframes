@@ -171,3 +171,41 @@ test("composeProject writes an editable HyperFrames project and thumbnail subpro
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test("a rerun never reuses a stale normalized clip merely because the output path exists", () => {
+  const dir = mkdtempSync(join(tmpdir(), "youtube-compose-stale-"));
+  try {
+    mkdirSync(join(dir, "assets/video"), { recursive: true });
+    mkdirSync(join(dir, "assets/voice"), { recursive: true });
+    mkdirSync(join(dir, "assets/youtube/scenes"), { recursive: true });
+    writeFileSync(join(dir, "assets/video/hook.mp4"), "new-hook");
+    writeFileSync(join(dir, "assets/video/broll.mp4"), "new-broll");
+    writeFileSync(join(dir, "assets/voice/hook.wav"), "voice");
+    writeFileSync(join(dir, "assets/voice/broll.wav"), "voice");
+    writeFileSync(join(dir, "assets/youtube/scenes/hook.mp4"), "stale");
+    writeFileSync(join(dir, "assets/youtube/scenes/broll.mp4"), "stale");
+    const calls = [];
+    const fakeSpawn = (_bin, args) => {
+      calls.push(args);
+      const output = args.at(-1);
+      mkdirSync(join(output, ".."), { recursive: true });
+      writeFileSync(output, "fresh");
+      return { status: 0, stdout: "", stderr: "" };
+    };
+    composeProject(
+      plan(),
+      {
+        scenes: {
+          hook: { path: "assets/video/hook.mp4", provider: "gemini" },
+          broll: { path: "assets/video/broll.mp4", provider: "comfyui" },
+        },
+      },
+      audio(),
+      { projectDir: dir, spawnSync: fakeSpawn },
+    );
+    assert.ok(calls.filter((args) => args.includes("-c:v")).length >= 2);
+    assert.equal(readFileSync(join(dir, "assets/youtube/scenes/hook.mp4"), "utf8"), "fresh");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
