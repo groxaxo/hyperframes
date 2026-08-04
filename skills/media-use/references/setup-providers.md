@@ -1,6 +1,43 @@
 # Setup and providers — install, auth, RAM ladders, forcing a provider
 
-## Gemini setup — preferred video and cloud TTS
+## ComfyUI LTX-2.3 — preferred private video path
+
+When `COMFYUI_LTX23_WORKFLOW` is configured, media-use first attempts a
+self-hosted LTX-2.3 graph through ComfyUI's HTTP API. The graph, models, GPU
+policy, and output encoding stay on infrastructure you control.
+
+```bash
+export COMFYUI_URL=http://127.0.0.1:8188
+export COMFYUI_LTX23_WORKFLOW=/absolute/path/to/ltx23-api.json
+```
+
+The workflow must be exported through ComfyUI's **Save (API Format)** option and
+must contain a `{{PROMPT}}` scalar placeholder. The provider also understands
+placeholders for negative prompt, seed, width, height, frames, FPS, checkpoint,
+filename prefix, duration, and aspect ratio. Full preparation and deployment
+instructions: `comfyui-ltx23.md`.
+
+Generate explicitly:
+
+```bash
+node <SKILL_DIR>/scripts/resolve.mjs \
+  --type video \
+  --provider comfyui \
+  --intent "A cinematic product reveal with synchronized sound" \
+  --project .
+```
+
+The adapter uses the native ComfyUI lifecycle: queue `/prompt`, poll
+`/history/{prompt_id}`, target `/interrupt` on timeout, and stream the selected
+video through `/view`. It supports authenticated reverse proxies with
+`COMFYUI_API_KEY`, `COMFYUI_API_KEY_HEADER`, and `COMFYUI_HEADERS_JSON`; secrets
+are sent only in headers.
+
+ComfyUI is marked as a network provider because it uses HTTP, even when hosted on
+the same machine. Therefore the hard `--local-only` guard skips it and keeps the
+direct `ltx.local` CLI as the zero-network fallback.
+
+## Gemini setup — preferred managed video and cloud TTS
 
 HyperFrames uses Google's dependency-free Interactions REST API for both
 generated video and narration. The skill never writes the key to disk or places
@@ -93,58 +130,62 @@ node <SKILL_DIR>/scripts/resolve.mjs --doctor
 
 ## Provider order
 
-media-use holds no credentials. Remote providers read their normal environment
+media-use stores no credentials. Remote providers read their normal environment
 or CLI-owned auth, and every resolved asset is frozen locally before it enters a
-composition. `resolve` spec-checks available RAM for local ladders through
-`describeModelLadder`.
+composition. `resolve` spec-checks available RAM for direct local model ladders
+through `describeModelLadder`.
 
-| Type      | Ordered provider path                                                                                                                               |
-| --------- | --------------------------------------------------------------------------------------------------------------------------------------------------- |
-| bgm/sfx   | HeyGen catalog; bundled SFX fallback                                                                                                                |
-| image     | HeyGen search; optional local mflux; Codex image generation                                                                                         |
-| voice     | **Gemini 3.1 Flash TTS** when a Google key exists → HeyGen TTS → local Kokoro                                                                      |
-| video     | **Gemini Omni Flash** when a Google key exists → HeyGen avatar video → local LTX                                                                   |
-| icon      | HeyGen asset search                                                                                                                                |
-| logo      | svgl → simple-icons → GitHub org avatar → domain favicon                                                                                           |
-| grade/lut | local core-preset map, params/CDN look index, deterministic `buildCube` fallback                                                                    |
+| Type      | Ordered provider path                                                                                                                                     |
+| --------- | --------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| bgm/sfx   | HeyGen catalog; bundled SFX fallback                                                                                                                      |
+| image     | HeyGen search; optional local mflux; Codex image generation                                                                                               |
+| voice     | **Gemini 3.1 Flash TTS** when a Google key exists → HeyGen TTS → local Kokoro                                                                            |
+| video     | **self-hosted ComfyUI LTX-2.3** when a workflow is configured → Gemini Omni → HeyGen avatar video → direct local LTX                                    |
+| icon      | HeyGen asset search                                                                                                                                      |
+| logo      | svgl → simple-icons → GitHub org avatar → domain favicon                                                                                                 |
+| grade/lut | local core-preset map, params/CDN look index, deterministic `buildCube` fallback                                                                          |
 
-Gemini providers return a clean miss when no Google key exists, so the existing
-fallback chain remains operational. Both Gemini providers are marked remote and
-metered: `--local-only` skips them, and the normal cost-confirmation rule applies
-to agent-initiated calls. A direct user request to generate with Gemini is
-already authorization to run that provider.
+The ComfyUI provider returns a clean miss without a workflow path, and Gemini
+providers return a clean miss without a Google key, so existing installations
+continue through the cascade without probes they did not configure. Gemini and
+HeyGen providers are marked remote and metered where applicable. ComfyUI is
+remote-but-self-hosted and free; direct LTX, Kokoro, mflux, and bundled SFX are
+local.
 
 To pin a generator, pass its prefix:
 
 ```bash
---provider gemini   # gemini.omni for video or gemini.tts for voice
+--provider comfyui # comfyui.ltx23, video only
+--provider gemini  # gemini.omni for video or gemini.tts for voice
 --provider heygen
 --provider kokoro
---provider ltx
+--provider ltx     # direct local LTX CLI
 ```
 
 A forced provider bypasses cache reuse and all nonmatching providers. For
-example, `--provider gemini` will fail clearly when no Google key is configured
-rather than silently returning a HeyGen or LTX result.
+example, `--provider comfyui` fails clearly when the API-format workflow is not
+configured rather than silently returning a Gemini or LTX result.
 
-`--local-only` is a hard network guard. It skips Gemini, HeyGen, Codex, and every
-other remote provider even when one is explicitly forced.
+`--local-only` is a hard HTTP/network guard. It skips ComfyUI, Gemini, HeyGen,
+Codex, and every other network provider even when one is explicitly forced.
 
-## CLI tools used
+## CLI tools and services used
 
-Gemini needs no installed SDK or CLI. It uses Node's built-in `fetch`. Other
-providers shell their existing tools:
+Gemini and ComfyUI need no installed JavaScript SDK. Both use Node's built-in
+`fetch`; ComfyUI itself runs as a separately managed service.
 
 | Tool / credential  | Serves                                                                                  | Enable                                                                                                                                        |
 | ------------------ | --------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
+| ComfyUI + LTXVideo | self-hosted LTX-2.3 workflows with native audio                                          | install current ComfyUI and `Lightricks/ComfyUI-LTXVideo`; export an API-format graph and set `COMFYUI_LTX23_WORKFLOW`                        |
 | Google API key     | Gemini Omni video + Gemini 3.1 Flash TTS                                                 | `export GEMINI_API_KEY=...` (or `GOOGLE_API_KEY`)                                                                                             |
 | `ffmpeg`/`ffprobe` | probing, adoption, smart-grade, cut, duck bake, loudnorm, non-Gemini cloud-audio convert | system package (`brew install ffmpeg` / `apt install ffmpeg`)                                                                                 |
 | `heygen`           | catalogs + HeyGen TTS + avatar video                                                     | verified HeyGen install, then `heygen auth login --oauth` (needs >= v0.3.0)                                                                  |
 | `mflux-generate`   | local image generation                                                                  | `uv venv ~/.venvs/mflux && VIRTUAL_ENV=~/.venvs/mflux uv pip install mflux==0.9.6`                                                            |
 | `codex`            | image generation through the user's ChatGPT subscription                                | Codex CLI, logged in via ChatGPT                                                                                                              |
 | `parakeet-mlx`     | local transcription                                                                     | `uv venv ~/.venvs/parakeet && VIRTUAL_ENV=~/.venvs/parakeet uv pip install parakeet-mlx`                                                      |
-| `ltx-2-mlx`        | local video generation                                                                  | `git clone https://github.com/dgrauet/ltx-2-mlx && cd ltx-2-mlx && uv sync --all-extras`                                                      |
+| `ltx-2-mlx`        | direct local video generation                                                           | `git clone https://github.com/dgrauet/ltx-2-mlx && cd ltx-2-mlx && uv sync --all-extras`                                                      |
 | `npx hyperframes`  | Kokoro TTS, whisper.cpp fallback, background removal                                     | via the HyperFrames CLI; whisper.cpp builds on first use and downloads its model                                                             |
 
-Without an optional tool or credential, its provider emits at most one useful
-diagnostic and the resolver falls through where another provider exists.
+Without an optional tool, service, workflow, or credential, its provider emits
+at most one useful diagnostic and the resolver falls through where another
+provider exists.
