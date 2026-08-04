@@ -30,7 +30,7 @@ test("listTypes exposes the v2 media types", () => {
   }
 });
 
-test("heygen provider is first for every type it serves", () => {
+test("heygen provider is first for every catalog type it serves", () => {
   for (const t of ["bgm", "sfx", "image", "icon"]) {
     const first = getProviders(t)[0];
     assert.ok(first, `no enabled provider for ${t}`);
@@ -38,9 +38,9 @@ test("heygen provider is first for every type it serves", () => {
   }
 });
 
-test("sanctioned providers only: heygen, local mflux/kokoro/ltx, codex, design spec, logo tiers", () => {
+test("sanctioned providers only: Gemini, HeyGen, local generators, codex, design and logo tiers", () => {
   const allowed =
-    /^heygen|^bundled\.sfx$|^mflux\.local$|^kokoro\.local$|^ltx\.local$|^codex\.image_gen$|^design_spec$|^svgl$|^simple-icons$|^github\.avatar$|^favicon\.ddg$|^color_grade\.local$|^cube_lut\.local$/;
+    /^gemini\.(?:omni|tts)$|^heygen|^bundled\.sfx$|^mflux\.local$|^kokoro\.local$|^ltx\.local$|^codex\.image_gen$|^design_spec$|^svgl$|^simple-icons$|^github\.avatar$|^favicon\.ddg$|^color_grade\.local$|^cube_lut\.local$/;
   for (const t of listTypes()) {
     for (const p of getProviders(t)) {
       assert.ok(allowed.test(p.name), `${t} lists unsanctioned provider: ${p.name}`);
@@ -61,24 +61,34 @@ test("image cascade: heygen catalog, then local mflux, then the codex upsell", (
   assert.ok(codex.network, "codex is network (skipped under --local-only)");
 });
 
-test("voice cascade: HeyGen TTS first, Kokoro remains the local fallback", () => {
+test("voice cascade: Gemini first, then HeyGen, with Kokoro as local fallback", () => {
   const ps = getProviders("voice");
-  assert.equal(ps[0].name, "heygen.tts", "HeyGen TTS is first when credentials exist");
-  assert.ok(ps[0].network, "HeyGen TTS is network (skipped under --local-only)");
-  assert.ok(ps[0].paid, "HeyGen TTS may bill after the OAuth free allowance");
-  assert.equal(ps[1].name, "kokoro.local", "local Kokoro is the offline fallback");
-  assert.ok(!ps[1].network, "local Kokoro kept under --local-only");
-  assert.ok(!ps[1].paid, "local Kokoro is free");
+  assert.deepEqual(providerNamesFor("voice"), ["gemini.tts", "heygen.tts", "kokoro.local"]);
+  assert.equal(providerMatches("voice", "gemini"), true);
+  assert.ok(ps[0].network, "Gemini TTS is network (skipped under --local-only)");
+  assert.ok(ps[0].paid, "Gemini TTS consumes metered API credits");
+  assert.equal(ps[1].name, "heygen.tts", "HeyGen remains the cloud fallback");
+  assert.ok(ps[1].network, "HeyGen TTS is network (skipped under --local-only)");
+  assert.equal(ps[2].name, "kokoro.local", "local Kokoro is the offline fallback");
+  assert.ok(!ps[2].network, "local Kokoro kept under --local-only");
+  assert.ok(!ps[2].paid, "local Kokoro is free");
 });
 
-test("video cascade: HeyGen first, LTX local fallback, generate-only", async () => {
-  assert.deepEqual(providerNamesFor("video"), ["heygen.video", "ltx.local"]);
+test("video cascade: Gemini Omni first, then HeyGen, then LTX; all generate-only", async () => {
+  assert.deepEqual(providerNamesFor("video"), [
+    "gemini.omni",
+    "heygen.video",
+    "ltx.local",
+  ]);
+  assert.equal(providerMatches("video", "gemini"), true);
   assert.equal(providerMatches("video", "ltx.local"), true);
 
   const ps = getProviders("video");
-  assert.ok(ps[0].network, "HeyGen video is network (skipped under --local-only)");
-  assert.ok(ps[0].paid, "HeyGen video may bill after the OAuth free allowance");
-  assert.ok(!ps[1].network, "local LTX is kept under --local-only");
+  assert.ok(ps[0].network, "Gemini Omni is network (skipped under --local-only)");
+  assert.ok(ps[0].paid, "Gemini Omni consumes metered API credits");
+  assert.ok(ps[1].network, "HeyGen video is network (skipped under --local-only)");
+  assert.ok(ps[1].paid, "HeyGen video may bill after the OAuth free allowance");
+  assert.ok(!ps[2].network, "local LTX is kept under --local-only");
   assert.equal(await runCapability("video", "search", "x", {}), null);
 });
 
@@ -119,6 +129,33 @@ test("ctx.provider forces one generator (e.g. 'make an image WITH codex')", asyn
     await runProviders(providers, "generate", "x", { provider: "mflux", localOnly: true }),
     { hit: "local" },
   );
+});
+
+test("provider prefix can pin both Gemini capabilities by media type", async () => {
+  const calls = [];
+  const providers = [
+    {
+      name: "gemini.omni",
+      network: true,
+      generate: async () => {
+        calls.push("gemini");
+        return { hit: "gemini" };
+      },
+    },
+    {
+      name: "heygen.video",
+      network: true,
+      generate: async () => {
+        calls.push("heygen");
+        return { hit: "heygen" };
+      },
+    },
+  ];
+  assert.deepEqual(
+    await runProviders(providers, "generate", "x", { provider: "gemini" }),
+    { hit: "gemini" },
+  );
+  assert.deepEqual(calls, ["gemini"]);
 });
 
 test("getProvider returns the first provider with its type, throws for unknown", () => {
