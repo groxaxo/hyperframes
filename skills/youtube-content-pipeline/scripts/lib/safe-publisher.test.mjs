@@ -49,12 +49,12 @@ async function consumeBody(body) {
   }
 }
 
-function isCaptionInsert(url) {
+function isCaptionWrite(url) {
   return url.includes("/upload/youtube/v3/captions?");
 }
 
 function isCaptionList(url) {
-  return url.includes("/youtube/v3/captions?") && !isCaptionInsert(url);
+  return url.includes("/youtube/v3/captions?") && !isCaptionWrite(url);
 }
 
 test("dry-run validates the package without OAuth or network", async () => {
@@ -93,12 +93,13 @@ test("successful publishing checkpoints session, video, thumbnail, captions, and
           return response({ status: 201, json: { id: "video123" } });
         }
         if (url.includes("/thumbnails/set")) return response({ json: { items: [] } });
-        if (isCaptionInsert(url)) return response({ json: { id: "caption123" } });
+        if (isCaptionWrite(url)) return response({ json: { id: "caption123" } });
         if (isCaptionList(url)) return response({ json: { items: [] } });
         throw new Error(`unexpected URL: ${url}`);
       },
     });
     assert.equal(result.video_id, "video123");
+    assert.equal(result.metadata_set, true);
     assert.equal(result.caption_id, "caption123");
     assert.equal(result.captions_skipped, false);
     assert.equal(result.publish_complete, true);
@@ -147,6 +148,63 @@ test("a narration-free package skips caption APIs and still completes", async ()
   }
 });
 
+test("mutable metadata, thumbnail, and captions update the existing video in place", async () => {
+  const dir = makePackage();
+  const initial = { video: "v1", metadata: "m1", thumbnail: "t1", captions: "c1" };
+  const changed = { video: "v1", metadata: "m2", thumbnail: "t2", captions: "c2" };
+  try {
+    await publishYouTubePackageSafely(plan(), dir, {
+      env: { YOUTUBE_ACCESS_TOKEN: "token" },
+      publishFingerprint: "release-1",
+      assetFingerprints: initial,
+      fetch: async (url, options = {}) => {
+        await consumeBody(options.body);
+        if (url.includes("/videos?uploadType=resumable")) {
+          return response({ headers: { location: "https://upload.example/original" } });
+        }
+        if (url === "https://upload.example/original") {
+          return response({ status: 201, json: { id: "stable-video" } });
+        }
+        if (url.includes("/thumbnails/set")) return response({ json: {} });
+        if (isCaptionList(url)) return response({ json: { items: [] } });
+        if (isCaptionWrite(url)) return response({ json: { id: "stable-caption" } });
+        throw new Error(`unexpected URL: ${url}`);
+      },
+    });
+
+    const calls = [];
+    const checkpoints = [];
+    const result = await publishYouTubePackageSafely(plan(), dir, {
+      env: { YOUTUBE_ACCESS_TOKEN: "token" },
+      publishFingerprint: "release-2",
+      assetFingerprints: changed,
+      onCheckpoint: async (checkpoint) => checkpoints.push(checkpoint.stage),
+      fetch: async (url, options = {}) => {
+        calls.push({ url, method: options.method || "GET" });
+        if (url.includes("/videos?uploadType=resumable") || url === "https://upload.example/original") {
+          throw new Error("the video payload must not upload again");
+        }
+        if (url.includes("/youtube/v3/videos?")) {
+          assert.equal(options.method, "PUT");
+          return response({ json: { id: "stable-video" } });
+        }
+        if (url.includes("/thumbnails/set")) return response({ json: {} });
+        if (isCaptionWrite(url)) {
+          assert.equal(options.method, "PUT");
+          return response({ json: { id: "stable-caption" } });
+        }
+        throw new Error(`unexpected URL: ${url}`);
+      },
+    });
+    assert.equal(result.video_id, "stable-video");
+    assert.equal(result.caption_id, "stable-caption");
+    assert.equal(calls.some((call) => call.url.includes("uploadType=resumable")), false);
+    assert.deepEqual(checkpoints, ["metadata_set", "thumbnail_set", "captions_updated", "complete"]);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("a post-upload failure preserves the video id and resumes without a duplicate video upload", async () => {
   const dir = makePackage();
   let firstUploadCalls = 0;
@@ -183,7 +241,7 @@ test("a post-upload failure preserves the video id and resumes without a duplica
     const resumed = await publishYouTubePackageSafely(plan(), dir, {
       env: { YOUTUBE_ACCESS_TOKEN: "token" },
       publishFingerprint: "fingerprint-b",
-      fetch: async (url) => {
+      fetch: async (url, options = {}) => {
         if (url.includes("/videos?uploadType=resumable") || url === "https://upload.example/session") {
           duplicateUploadCalls += 1;
           throw new Error("video upload must not repeat");
@@ -195,6 +253,10 @@ test("a post-upload failure preserves the video id and resumes without a duplica
               items: [{ id: "existing-caption", snippet: { language: "en-NZ", name: "en-NZ" } }],
             },
           });
+        }
+        if (isCaptionWrite(url)) {
+          assert.equal(options.method, "PUT");
+          return response({ json: { id: "existing-caption" } });
         }
         throw new Error(`unexpected URL: ${url}`);
       },
@@ -225,7 +287,7 @@ test("a crash after upload can recover the video id from the persisted resumable
         }
         if (url.includes("/thumbnails/set")) return response({ json: {} });
         if (isCaptionList(url)) return response({ json: { items: [] } });
-        if (isCaptionInsert(url)) return response({ json: { id: "recovered-caption" } });
+        if (isCaptionWrite(url)) return response({ json: { id: "recovered-caption" } });
         throw new Error(`unexpected URL: ${url}`);
       },
     });
@@ -237,15 +299,20 @@ test("a crash after upload can recover the video id from the persisted resumable
   }
 });
 
-test("a changed publish fingerprint never reuses an older video's checkpoint", async () => {
+test("a changed video fingerprint starts a new upload instead of reusing an older video", async () => {
   const dir = makePackage();
   try {
     writeFileSync(
       join(dir, "publish-receipt.json"),
       JSON.stringify({
         publish_fingerprint: "old",
+        video_fingerprint: "old-video-bytes",
+        metadata_fingerprint: "m",
+        thumbnail_fingerprint: "t",
+        caption_fingerprint: "c",
         video_id: "old-video",
         video_upload_complete: true,
+        metadata_set: true,
         thumbnail_set: true,
         caption_id: "old-caption",
       }),
@@ -254,6 +321,7 @@ test("a changed publish fingerprint never reuses an older video's checkpoint", a
     await publishYouTubePackageSafely(plan(), dir, {
       env: { YOUTUBE_ACCESS_TOKEN: "token" },
       publishFingerprint: "new",
+      assetFingerprints: { video: "new-video-bytes", metadata: "m", thumbnail: "t", captions: "c" },
       fetch: async (url, options = {}) => {
         await consumeBody(options.body);
         if (url.includes("/videos?uploadType=resumable")) {
@@ -264,8 +332,8 @@ test("a changed publish fingerprint never reuses an older video's checkpoint", a
           return response({ status: 201, json: { id: "new-video" } });
         }
         if (url.includes("/thumbnails/set")) return response({ json: {} });
-        if (isCaptionInsert(url)) return response({ json: { id: "new-caption" } });
         if (isCaptionList(url)) return response({ json: { items: [] } });
+        if (isCaptionWrite(url)) return response({ json: { id: "new-caption" } });
         throw new Error(`unexpected URL: ${url}`);
       },
     });
