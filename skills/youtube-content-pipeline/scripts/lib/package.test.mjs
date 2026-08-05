@@ -48,6 +48,18 @@ function composition() {
   };
 }
 
+function probe({ duration = 30, width = 1920, height = 1080, audio = false, videoCodec = "h264", audioCodec = "aac" } = {}) {
+  return {
+    format: { duration: String(duration) },
+    streams: [
+      { codec_type: "video", codec_name: videoCodec, width, height },
+      ...(audio
+        ? [{ codec_type: "audio", codec_name: audioCodec, sample_rate: "48000", channels: 2 }]
+        : []),
+    ],
+  };
+}
+
 test("chapter formatting emits a compliant 0:00 block only for eligible schedules", () => {
   assert.equal(formatChapterTimestamp(65), "1:05");
   assert.deepEqual(buildChapterLines(composition().schedule), [
@@ -79,18 +91,15 @@ test("render stage runs check, render, and ffprobe verification", () => {
         writeFileSync(output, "video");
       }
       if (bin === "ffprobe") {
-        return {
-          status: 0,
-          stdout: JSON.stringify({
-            format: { duration: "30.0" },
-            streams: [{ codec_type: "video", codec_name: "h264", width: 1920, height: 1080 }],
-          }),
-          stderr: "",
-        };
+        return { status: 0, stdout: JSON.stringify(probe()), stderr: "" };
       }
       return { status: 0, stdout: "", stderr: "" };
     };
-    const result = renderProject(composition(), { projectDir: dir, outputPath: output, spawnSync });
+    const result = renderProject(composition(), {
+      projectDir: dir,
+      outputPath: output,
+      spawnSync,
+    });
     assert.equal(result.verification.duration_s, 30);
     assert.equal(calls.filter(([bin]) => bin.includes("npx")).length, 2);
   } finally {
@@ -108,14 +117,76 @@ test("verifyRenderedVideo rejects an implausible render duration", () => {
         verifyRenderedVideo(video, composition(), {
           spawnSync: () => ({
             status: 0,
-            stdout: JSON.stringify({
-              format: { duration: "10" },
-              streams: [{ codec_type: "video", width: 1920, height: 1080 }],
-            }),
+            stdout: JSON.stringify(probe({ duration: 10 })),
             stderr: "",
           }),
         }),
       /differs from composition/,
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("verifyRenderedVideo rejects a silent render when narration was scheduled", () => {
+  const dir = mkdtempSync(join(tmpdir(), "youtube-silent-render-"));
+  try {
+    const video = join(dir, "video.mp4");
+    writeFileSync(video, "video");
+    const expected = composition();
+    expected.schedule.scenes[0].voice_path = "assets/voice/hook.wav";
+    assert.throws(
+      () =>
+        verifyRenderedVideo(video, expected, {
+          spawnSync: () => ({
+            status: 0,
+            stdout: JSON.stringify(probe({ audio: false })),
+            stderr: "",
+          }),
+        }),
+      /rendered file is silent/,
+    );
+    const valid = verifyRenderedVideo(video, expected, {
+      spawnSync: () => ({
+        status: 0,
+        stdout: JSON.stringify(probe({ audio: true })),
+        stderr: "",
+      }),
+    });
+    assert.equal(valid.audio.codec_name, "aac");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("verifyRenderedVideo rejects non-H264 or non-AAC delivery codecs", () => {
+  const dir = mkdtempSync(join(tmpdir(), "youtube-codecs-"));
+  try {
+    const video = join(dir, "video.mp4");
+    writeFileSync(video, "video");
+    assert.throws(
+      () =>
+        verifyRenderedVideo(video, composition(), {
+          spawnSync: () => ({
+            status: 0,
+            stdout: JSON.stringify(probe({ videoCodec: "vp9" })),
+            stderr: "",
+          }),
+        }),
+      /expected YouTube-safe h264/,
+    );
+    const expected = composition();
+    expected.expected_audio = true;
+    assert.throws(
+      () =>
+        verifyRenderedVideo(video, expected, {
+          spawnSync: () => ({
+            status: 0,
+            stdout: JSON.stringify(probe({ audio: true, audioCodec: "opus" })),
+            stderr: "",
+          }),
+        }),
+      /expected YouTube-safe aac/,
     );
   } finally {
     rmSync(dir, { recursive: true, force: true });
@@ -147,7 +218,10 @@ test("package stage creates the complete release unit", () => {
     });
     assert.equal(result.files.length, 8);
     assert.equal(existsSync(join(dir, "youtube-package/thumbnail.jpg")), true);
-    assert.match(readFileSync(join(dir, "youtube-package/description.txt"), "utf8"), /0:10/);
+    assert.match(
+      readFileSync(join(dir, "youtube-package/description.txt"), "utf8"),
+      /0:10/,
+    );
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
