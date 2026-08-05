@@ -1,7 +1,16 @@
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { dirname, join, relative, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
 import { execFile as nodeExecFile, spawnSync as nodeSpawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
+import {
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  renameSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
+import { dirname, isAbsolute, join, relative, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { stableHash } from "./plan.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -9,12 +18,27 @@ export const DEFAULT_RESOLVE_SCRIPT = resolve(HERE, "../../../media-use/scripts/
 export const DEFAULT_AUDIO_SCRIPT = resolve(HERE, "../../../media-use/audio/scripts/audio.mjs");
 
 export class PipelineCommandError extends Error {
-  constructor(message, { status = null, stdout = "", stderr = "" } = {}) {
+  constructor(
+    message,
+    {
+      status = null,
+      stdout = "",
+      stderr = "",
+      code = null,
+      retryable = false,
+      taskId = null,
+      sessionUrl = null,
+    } = {},
+  ) {
     super(message);
     this.name = "PipelineCommandError";
     this.status = status;
     this.stdout = stdout;
     this.stderr = stderr;
+    this.code = code;
+    this.retryable = Boolean(retryable);
+    this.taskId = taskId;
+    this.sessionUrl = sessionUrl;
   }
 }
 
@@ -31,6 +55,14 @@ function parseJsonOutput(stdout) {
     }
   }
   return null;
+}
+
+function taskIdFromText(value) {
+  const text = String(value || "");
+  const match =
+    /(?:task[_ -]?id|task)\s*(?:=|:|is)?\s*["']?([A-Za-z0-9_-]{4,})/i.exec(text) ||
+    /\bpaid-task\b/i.exec(text);
+  return match?.[1] || match?.[0] || null;
 }
 
 export function runNodeJson(
@@ -54,10 +86,23 @@ export function runNodeJson(
         const status = error && Number.isInteger(error.code) ? error.code : error ? null : 0;
         if (error || payload?.ok === false) {
           const detail = payload?.error || String(stderr || stdout || error?.message || "").trim();
+          const taskId =
+            payload?.task_id ||
+            payload?.taskId ||
+            taskIdFromText(payload?.error) ||
+            taskIdFromText(stderr);
           reject(
             new PipelineCommandError(
               `${script} exited${status != null ? ` with status ${status}` : ""}${detail ? ` — ${detail}` : ""}`,
-              { status, stdout, stderr },
+              {
+                status,
+                stdout,
+                stderr,
+                code: payload?.code || null,
+                retryable: payload?.retryable || false,
+                taskId,
+                sessionUrl: payload?.session_url || payload?.sessionUrl || null,
+              },
             ),
           );
           return;
@@ -167,27 +212,107 @@ function absoluteAsset(projectDir, assetPath) {
   return resolve(projectDir, assetPath);
 }
 
+function isNonEmptyFile(path) {
+  try {
+    return statSync(path).isFile() && statSync(path).size > 0;
+  } catch {
+    return false;
+  }
+}
+
 function existingSceneRecord(record, projectDir, inputHash) {
   return (
     record &&
     record.input_hash === inputHash &&
     typeof record.path === "string" &&
-    existsSync(absoluteAsset(projectDir, record.path))
+    isNonEmptyFile(absoluteAsset(projectDir, record.path))
   );
+}
+
+function sha256File(path) {
+  try {
+    return createHash("sha256").update(readFileSync(path)).digest("hex");
+  } catch {
+    return null;
+  }
+}
+
+function configuredWorkflow(projectDir, env) {
+  const value = env.COMFYUI_LTX23_WORKFLOW || env.COMFYUI_LTX_WORKFLOW;
+  if (!value) return { path: null, hash: null };
+  const path = isAbsolute(value) ? value : resolve(projectDir, value);
+  return { path, hash: sha256File(path) };
+}
+
+export function sceneProviderFingerprint(
+  plan,
+  scene,
+  {
+    projectDir,
+    env = process.env,
+    workerSlot = 0,
+  } = {},
+) {
+  const providerEnv = sceneProviderEnv(plan, scene, env, { workerSlot });
+  if (scene.provider === "comfyui") {
+    const workflow = configuredWorkflow(projectDir, providerEnv);
+    return stableHash({
+      provider: "comfyui",
+      workflow_hash: workflow.hash,
+      workflow_configured: Boolean(workflow.path),
+      model: providerEnv.COMFYUI_LTX23_MODEL || null,
+      bindings: providerEnv.COMFYUI_LTX23_BINDINGS_JSON || null,
+      width: providerEnv.COMFYUI_LTX23_WIDTH || null,
+      height: providerEnv.COMFYUI_LTX23_HEIGHT || null,
+      frames: providerEnv.COMFYUI_LTX23_FRAMES,
+      fps: providerEnv.COMFYUI_LTX23_FPS,
+      negative_prompt: providerEnv.COMFYUI_LTX23_NEGATIVE_PROMPT,
+    });
+  }
+  if (scene.provider === "minimax") {
+    return stableHash({
+      provider: "minimax",
+      api_host: providerEnv.MINIMAX_API_HOST || providerEnv.MINIMAX_API_BASE_URL || "global",
+      resolution: providerEnv.MINIMAX_H3_RESOLUTION || "2K",
+      duration: providerEnv.MINIMAX_H3_DURATION,
+      ratio: providerEnv.MINIMAX_H3_RATIO,
+      negative_prompt: providerEnv.MINIMAX_H3_NEGATIVE_PROMPT,
+      first_frame: providerEnv.MINIMAX_H3_FIRST_FRAME || null,
+      last_frame: providerEnv.MINIMAX_H3_LAST_FRAME || null,
+      reference_images: providerEnv.MINIMAX_H3_REFERENCE_IMAGES_JSON || null,
+      reference_videos: providerEnv.MINIMAX_H3_REFERENCE_VIDEOS_JSON || null,
+      reference_audios: providerEnv.MINIMAX_H3_REFERENCE_AUDIOS_JSON || null,
+    });
+  }
+  if (scene.provider === "gemini") {
+    return stableHash({
+      provider: "gemini",
+      model: providerEnv.GEMINI_VIDEO_MODEL || "gemini-omni-flash-preview",
+      aspect_ratio: providerEnv.GEMINI_VIDEO_ASPECT_RATIO,
+    });
+  }
+  return stableHash({ provider: scene.provider });
 }
 
 async function mapWithConcurrency(items, concurrency, worker) {
   const results = new Array(items.length);
   let cursor = 0;
+  let firstError = null;
   async function runWorker() {
-    while (true) {
+    while (!firstError) {
       const index = cursor;
       cursor += 1;
       if (index >= items.length) return;
-      results[index] = await worker(items[index], index);
+      try {
+        results[index] = await worker(items[index], index);
+      } catch (error) {
+        firstError ||= error;
+        return;
+      }
     }
   }
   await Promise.all(Array.from({ length: Math.min(concurrency, items.length) }, runWorker));
+  if (firstError) throw firstError;
   return results;
 }
 
@@ -195,6 +320,19 @@ function requiredProviderFamilies(policy) {
   if (policy === "tri-hybrid") return ["gemini", "comfyui", "minimax"];
   if (policy === "hybrid") return ["gemini", "comfyui"];
   return [];
+}
+
+let manifestWriteSequence = 0;
+function writeManifestAtomic(path, value) {
+  manifestWriteSequence += 1;
+  const temp = `${path}.tmp-${process.pid}-${manifestWriteSequence}`;
+  try {
+    writeFileSync(temp, `${JSON.stringify(value, null, 2)}\n`, { mode: 0o600 });
+    renameSync(temp, path);
+  } catch (error) {
+    rmSync(temp, { force: true });
+    throw error;
+  }
 }
 
 export async function generateVisuals(
@@ -226,24 +364,34 @@ export async function generateVisuals(
     plan.scenes,
     plan.production.max_concurrency,
     async (scene, index) => {
+      const providers = [scene.provider, scene.fallback_provider].filter(
+        (provider, position, all) => provider && all.indexOf(provider) === position,
+      );
+      const comfyOrdinal = Math.max(0, comfySceneIds.indexOf(scene.id));
+      const runtimeFingerprints = providers.map((provider) => {
+        const candidate = { ...scene, provider };
+        return sceneProviderFingerprint(plan, candidate, {
+          projectDir,
+          env,
+          workerSlot: provider === "comfyui" ? comfyOrdinal : 0,
+        });
+      });
       const inputHash = stableHash({
         scene,
         format: plan.video.format,
         width: plan.video.width,
         height: plan.video.height,
+        runtime_fingerprints: runtimeFingerprints,
       });
       if (!force && existingSceneRecord(records[scene.id], projectDir, inputHash)) {
         onProgress({ type: "skip", scene, index, record: records[scene.id] });
         return records[scene.id];
       }
 
-      const providers = [scene.provider, scene.fallback_provider].filter(
-        (provider, position, all) => provider && all.indexOf(provider) === position,
-      );
       let lastError;
       for (const provider of providers) {
         const candidate = { ...scene, provider };
-        const workerSlot = provider === "comfyui" ? Math.max(0, comfySceneIds.indexOf(scene.id)) : 0;
+        const workerSlot = provider === "comfyui" ? comfyOrdinal : 0;
         onProgress({ type: "start", scene: candidate, index, workerSlot });
         try {
           const payload = await runJson(
@@ -279,22 +427,23 @@ export async function generateVisuals(
               worker_pool_size: comfyPoolSize,
             }),
             input_hash: inputHash,
+            runtime_fingerprint: runtimeFingerprints[providers.indexOf(provider)],
             provenance: payload.provenance || {},
           };
           records[scene.id] = record;
-          writeFileSync(
-            manifestPath,
-            `${JSON.stringify({ version: 1, plan_hash: stableHash(plan), scenes: records }, null, 2)}\n`,
-          );
+          writeManifestAtomic(manifestPath, {
+            version: 1,
+            plan_hash: stableHash(plan),
+            scenes: records,
+          });
           onProgress({ type: "complete", scene: candidate, index, record });
           return record;
         } catch (error) {
           lastError = error;
           onProgress({ type: "provider-failed", scene: candidate, index, error });
-          // An H3 subprocess error may cross a JSON boundary that cannot retain
-          // the in-memory taskId property. Treat every explicit MiniMax attempt
-          // as strict: never invoke another provider after it, because a paid H3
-          // task may already exist even when the local response was interrupted.
+          // Explicit MiniMax is paid. Any transport failure during task creation
+          // is ambiguous, even without a task ID, so never invoke another video
+          // provider automatically after an H3 attempt.
           if (provider === "minimax" || error?.taskId) throw error;
         }
       }
@@ -314,7 +463,7 @@ export async function generateVisuals(
     );
   }
   const manifest = { version: 1, plan_hash: stableHash(plan), scenes: records };
-  writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
+  writeManifestAtomic(manifestPath, manifest);
   return { manifestPath, manifest, generated };
 }
 
