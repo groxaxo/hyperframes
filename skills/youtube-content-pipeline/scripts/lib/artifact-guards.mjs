@@ -91,7 +91,7 @@ export function publishArtifactsCurrent(paths) {
     receipt?.video_id &&
       receipt?.video_upload_complete &&
       receipt?.thumbnail_set &&
-      receipt?.caption_id &&
+      (receipt?.caption_id || receipt?.captions_skipped) &&
       receipt?.publish_complete,
   );
 }
@@ -137,6 +137,7 @@ export function compositionInputFingerprint(projectDir, composition) {
         scene?.path,
       ]),
       ...voicePaths,
+      composition?.audio?.bgm_path,
     ].filter(Boolean),
   );
 }
