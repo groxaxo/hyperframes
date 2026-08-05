@@ -8,6 +8,7 @@ import {
 import { basename, join } from "node:path";
 import {
   YOUTUBE_API_BASE,
+  YOUTUBE_UPLOAD_BASE,
   YouTubeApiError,
   buildYouTubeVideoResource,
   getYouTubeAccessToken,
@@ -84,6 +85,21 @@ async function responseDetail(response) {
   }
 }
 
+async function responseJson(response, label) {
+  try {
+    return await response.json();
+  } catch (error) {
+    throw new YouTubeApiError(`${label} returned invalid JSON: ${error?.message || error}`, {
+      status: response.status,
+      code: "invalid_json",
+    });
+  }
+}
+
+function retryableStatus(status) {
+  return status === 408 || status === 409 || status === 429 || status >= 500;
+}
+
 export async function findYouTubeCaption(
   videoId,
   language,
@@ -109,19 +125,11 @@ export async function findYouTubeCaption(
         {
           status: response.status,
           code: "caption_lookup_failed",
-          retryable: response.status === 429 || response.status >= 500,
+          retryable: retryableStatus(response.status),
         },
       );
     }
-    let payload;
-    try {
-      payload = await response.json();
-    } catch (error) {
-      throw new YouTubeApiError(`YouTube caption lookup returned invalid JSON: ${error?.message || error}`, {
-        status: response.status,
-        code: "caption_lookup_invalid_json",
-      });
-    }
+    const payload = await responseJson(response, "YouTube caption lookup");
     const match = (payload?.items || []).find((item) => {
       const snippet = item?.snippet || {};
       return snippet.language === language && String(snippet.name || "") === String(name || "");
@@ -130,6 +138,131 @@ export async function findYouTubeCaption(
     pageToken = payload?.nextPageToken || null;
   } while (pageToken);
   return null;
+}
+
+export async function updateYouTubeVideoResource(
+  videoId,
+  resource,
+  {
+    accessToken,
+    fetch: fetchImpl = globalThis.fetch,
+    apiBase = YOUTUBE_API_BASE,
+  } = {},
+) {
+  const response = await fetchImpl(
+    `${apiBase}/videos?part=snippet%2Cstatus`,
+    {
+      method: "PUT",
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        "Content-Type": "application/json; charset=UTF-8",
+      },
+      body: JSON.stringify({ id: videoId, ...resource }),
+    },
+  );
+  if (!response.ok) {
+    throw new YouTubeApiError(
+      `YouTube metadata update failed: HTTP ${response.status} — ${await responseDetail(response)}`,
+      {
+        status: response.status,
+        code: "metadata_update_failed",
+        retryable: retryableStatus(response.status),
+      },
+    );
+  }
+  return responseJson(response, "YouTube metadata update");
+}
+
+function buildCaptionUpdateMultipart(videoId, captionId, captionPath, language, name) {
+  const boundary = `youtube-caption-update-${Date.now().toString(36)}-${process.pid}`;
+  const metadata = JSON.stringify({
+    id: captionId,
+    snippet: {
+      videoId,
+      language,
+      name,
+      isDraft: false,
+    },
+  });
+  const caption = readFileSync(captionPath);
+  const head = Buffer.from(
+    `--${boundary}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n${metadata}\r\n` +
+      `--${boundary}\r\nContent-Type: application/octet-stream\r\n\r\n`,
+  );
+  const tail = Buffer.from(`\r\n--${boundary}--\r\n`);
+  return { boundary, body: Buffer.concat([head, caption, tail]) };
+}
+
+export async function updateYouTubeCaption(
+  videoId,
+  captionId,
+  captionPath,
+  language,
+  {
+    accessToken,
+    fetch: fetchImpl = globalThis.fetch,
+    uploadBase = YOUTUBE_UPLOAD_BASE,
+    name = language,
+  } = {},
+) {
+  const multipart = buildCaptionUpdateMultipart(
+    videoId,
+    captionId,
+    captionPath,
+    language,
+    name,
+  );
+  const response = await fetchImpl(
+    `${uploadBase}/captions?part=snippet&uploadType=multipart`,
+    {
+      method: "PUT",
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        "Content-Type": `multipart/related; boundary=${multipart.boundary}`,
+        "Content-Length": String(multipart.body.length),
+      },
+      body: multipart.body,
+    },
+  );
+  if (!response.ok) {
+    throw new YouTubeApiError(
+      `YouTube caption update failed: HTTP ${response.status} — ${await responseDetail(response)}`,
+      {
+        status: response.status,
+        code: "caption_update_failed",
+        retryable: retryableStatus(response.status),
+      },
+    );
+  }
+  return responseJson(response, "YouTube caption update");
+}
+
+export async function deleteYouTubeCaption(
+  captionId,
+  {
+    accessToken,
+    fetch: fetchImpl = globalThis.fetch,
+    apiBase = YOUTUBE_API_BASE,
+  } = {},
+) {
+  const response = await fetchImpl(
+    `${apiBase}/captions?id=${encodeURIComponent(captionId)}`,
+    {
+      method: "DELETE",
+      headers: { Authorization: `Bearer ${accessToken}` },
+    },
+  );
+  if (!response.ok) {
+    throw new YouTubeApiError(
+      `YouTube caption deletion failed: HTTP ${response.status} — ${await responseDetail(response)}`,
+      {
+        status: response.status,
+        code: "caption_delete_failed",
+        retryable: retryableStatus(response.status),
+      },
+    );
+  }
+  return true;
 }
 
 function checkpointError(error, checkpoint, stage) {
@@ -159,6 +292,17 @@ function setUploadedVideo(checkpoint, resource, sessionUrl) {
   checkpoint.watch_url = `https://www.youtube.com/watch?v=${videoId}`;
   checkpoint.upload_session = sessionUrl;
   checkpoint.video_upload_complete = true;
+  checkpoint.metadata_set = true;
+}
+
+function normalizeFingerprints(assetFingerprints, publishFingerprint) {
+  const fallback = publishFingerprint || null;
+  return {
+    video: assetFingerprints?.video || fallback,
+    metadata: assetFingerprints?.metadata || fallback,
+    thumbnail: assetFingerprints?.thumbnail || fallback,
+    captions: assetFingerprints?.captions || fallback,
+  };
 }
 
 export async function publishYouTubePackageSafely(
@@ -171,6 +315,7 @@ export async function publishYouTubePackageSafely(
     fetch: fetchImpl = globalThis.fetch,
     sleep,
     publishFingerprint = null,
+    assetFingerprints = null,
     resume = {},
     onCheckpoint = async () => {},
   } = {},
@@ -178,44 +323,93 @@ export async function publishYouTubePackageSafely(
   const files = packageFiles(packageDir);
   assertPackage(files);
   const hasCaptionCues = captionsContainCues(files.captions);
+  const fingerprints = normalizeFingerprints(assetFingerprints, publishFingerprint);
   const resource = buildYouTubeVideoResource(plan, privacy);
   const preview = {
     dry_run: Boolean(dryRun),
     files: Object.fromEntries(Object.entries(files).map(([key, path]) => [key, basename(path)])),
     resource,
     captions_will_upload: hasCaptionCues,
+    asset_fingerprints: fingerprints,
   };
   if (dryRun) return preview;
 
   const receiptPath = join(packageDir, "publish-receipt.json");
   const previous = readReceipt(receiptPath);
-  const previousMatches = Boolean(
+  const legacyMatch = Boolean(
     previous && publishFingerprint && previous.publish_fingerprint === publishFingerprint,
   );
+  const sameVideo = Boolean(
+    previous &&
+      fingerprints.video &&
+      (previous.video_fingerprint === fingerprints.video ||
+        (!previous.video_fingerprint && legacyMatch)),
+  );
+  const resumeMatches = Boolean(
+    resume.videoId &&
+      (!resume.videoFingerprint || resume.videoFingerprint === fingerprints.video),
+  );
+  const previousVideoId = sameVideo ? previous.video_id : null;
+  const videoId = resumeMatches ? resume.videoId : previousVideoId;
+  const knownCaptionId =
+    (resumeMatches ? resume.captionId : null) ||
+    (sameVideo ? previous.caption_id : null) ||
+    null;
+  const metadataCurrent = Boolean(
+    videoId &&
+      ((resumeMatches && resume.metadataSet && resume.metadataFingerprint === fingerprints.metadata) ||
+        (sameVideo &&
+          previous.metadata_set &&
+          previous.metadata_fingerprint === fingerprints.metadata &&
+          previous.privacy === privacy)),
+  );
+  const thumbnailCurrent = Boolean(
+    videoId &&
+      ((resumeMatches && resume.thumbnailSet && resume.thumbnailFingerprint === fingerprints.thumbnail) ||
+        (sameVideo &&
+          previous.thumbnail_set &&
+          previous.thumbnail_fingerprint === fingerprints.thumbnail)),
+  );
+  const captionsCurrent = Boolean(
+    videoId &&
+      hasCaptionCues &&
+      ((resumeMatches && resume.captionId && resume.captionFingerprint === fingerprints.captions) ||
+        (sameVideo &&
+          previous.caption_id &&
+          previous.caption_fingerprint === fingerprints.captions)),
+  );
+  const captionSkipCurrent = Boolean(
+    videoId &&
+      !hasCaptionCues &&
+      ((resumeMatches && resume.captionsSkipped && resume.captionFingerprint === fingerprints.captions) ||
+        (sameVideo &&
+          previous.captions_skipped &&
+          previous.caption_fingerprint === fingerprints.captions)),
+  );
+
   const checkpoint = {
     ...preview,
     dry_run: false,
     publish_fingerprint: publishFingerprint,
+    video_fingerprint: fingerprints.video,
+    metadata_fingerprint: fingerprints.metadata,
+    thumbnail_fingerprint: fingerprints.thumbnail,
+    caption_fingerprint: fingerprints.captions,
     privacy,
-    upload_session: resume.sessionUrl || (previousMatches ? previous.upload_session : null) || null,
-    video_id: resume.videoId || (previousMatches ? previous.video_id : null) || null,
-    watch_url: null,
-    video_upload_complete: Boolean(
-      resume.videoId || (previousMatches && previous.video_upload_complete),
-    ),
-    thumbnail_set: Boolean(resume.thumbnailSet || (previousMatches && previous.thumbnail_set)),
-    caption_id: resume.captionId || (previousMatches ? previous.caption_id : null) || null,
-    captions_skipped: Boolean(
-      resume.captionsSkipped ||
-        (previousMatches && previous.captions_skipped) ||
-        !hasCaptionCues,
-    ),
+    upload_session:
+      (resumeMatches ? resume.sessionUrl : null) ||
+      (sameVideo ? previous.upload_session : null) ||
+      null,
+    video_id: videoId || null,
+    watch_url: videoId ? `https://www.youtube.com/watch?v=${videoId}` : null,
+    video_upload_complete: Boolean(videoId),
+    metadata_set: metadataCurrent,
+    thumbnail_set: thumbnailCurrent,
+    caption_id: captionsCurrent ? knownCaptionId : null,
+    captions_skipped: captionSkipCurrent,
     publish_complete: false,
     updated_at: new Date().toISOString(),
   };
-  if (checkpoint.video_id) {
-    checkpoint.watch_url = `https://www.youtube.com/watch?v=${checkpoint.video_id}`;
-  }
 
   const persist = async (stage) => {
     checkpoint.updated_at = new Date().toISOString();
@@ -278,6 +472,20 @@ export async function publishYouTubePackageSafely(
     }
   }
 
+  if (!checkpoint.metadata_set) {
+    try {
+      await updateYouTubeVideoResource(checkpoint.video_id, resource, {
+        accessToken: token.accessToken,
+        fetch: fetchImpl,
+      });
+      checkpoint.metadata_set = true;
+      await persist("metadata_set");
+    } catch (error) {
+      await persist("metadata_failed");
+      throw checkpointError(error, checkpoint, "metadata");
+    }
+  }
+
   if (!checkpoint.thumbnail_set) {
     try {
       await setYouTubeThumbnail(checkpoint.video_id, files.thumbnail, {
@@ -292,41 +500,72 @@ export async function publishYouTubePackageSafely(
     }
   }
 
-  if (!hasCaptionCues && !checkpoint.captions_skipped) {
-    checkpoint.captions_skipped = true;
-  }
-  if (checkpoint.captions_skipped) {
-    if (checkpoint.stage !== "captions_skipped") await persist("captions_skipped");
+  if (!hasCaptionCues) {
+    try {
+      const existing =
+        knownCaptionId ||
+        (await findYouTubeCaption(
+          checkpoint.video_id,
+          plan.video.language,
+          plan.video.language,
+          { accessToken: token.accessToken, fetch: fetchImpl },
+        ))?.id ||
+        null;
+      if (existing) {
+        await deleteYouTubeCaption(existing, {
+          accessToken: token.accessToken,
+          fetch: fetchImpl,
+        });
+      }
+      checkpoint.caption_id = null;
+      checkpoint.captions_skipped = true;
+      await persist("captions_skipped");
+    } catch (error) {
+      await persist("captions_delete_failed");
+      throw checkpointError(error, checkpoint, "captions_delete");
+    }
   } else if (!checkpoint.caption_id) {
     const captionName = plan.video.language;
     try {
-      const existing = await findYouTubeCaption(
-        checkpoint.video_id,
-        plan.video.language,
-        captionName,
-        { accessToken: token.accessToken, fetch: fetchImpl },
-      );
-      if (existing?.id) {
-        checkpoint.caption_id = String(existing.id);
-      } else {
-        const captions = await insertYouTubeCaptions(
+      const existing =
+        knownCaptionId ||
+        (await findYouTubeCaption(
           checkpoint.video_id,
-          files.captions,
           plan.video.language,
-          {
-            accessToken: token.accessToken,
-            fetch: fetchImpl,
-            name: captionName,
-          },
-        );
-        if (!captions?.id) {
-          throw new YouTubeApiError("YouTube caption insertion returned no caption id", {
-            code: "missing_caption_id",
-          });
-        }
-        checkpoint.caption_id = String(captions.id);
+          captionName,
+          { accessToken: token.accessToken, fetch: fetchImpl },
+        ))?.id ||
+        null;
+      const captions = existing
+        ? await updateYouTubeCaption(
+            checkpoint.video_id,
+            existing,
+            files.captions,
+            plan.video.language,
+            {
+              accessToken: token.accessToken,
+              fetch: fetchImpl,
+              name: captionName,
+            },
+          )
+        : await insertYouTubeCaptions(
+            checkpoint.video_id,
+            files.captions,
+            plan.video.language,
+            {
+              accessToken: token.accessToken,
+              fetch: fetchImpl,
+              name: captionName,
+            },
+          );
+      if (!captions?.id) {
+        throw new YouTubeApiError("YouTube caption write returned no caption id", {
+          code: "missing_caption_id",
+        });
       }
-      await persist("captions_set");
+      checkpoint.caption_id = String(captions.id);
+      checkpoint.captions_skipped = false;
+      await persist(existing ? "captions_updated" : "captions_set");
     } catch (error) {
       await persist("captions_failed");
       throw checkpointError(error, checkpoint, "captions");
@@ -335,7 +574,7 @@ export async function publishYouTubePackageSafely(
 
   checkpoint.publish_complete = true;
   checkpoint.published_at =
-    previousMatches && previous?.published_at
+    sameVideo && previous?.published_at
       ? previous.published_at
       : new Date().toISOString();
   await persist("complete");
