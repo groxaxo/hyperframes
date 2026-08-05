@@ -1,7 +1,6 @@
 import { execFile as nodeExecFile, spawnSync as nodeSpawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
-  existsSync,
   mkdirSync,
   readFileSync,
   renameSync,
@@ -16,6 +15,8 @@ import { stableHash } from "./plan.mjs";
 const HERE = dirname(fileURLToPath(import.meta.url));
 export const DEFAULT_RESOLVE_SCRIPT = resolve(HERE, "../../../media-use/scripts/resolve.mjs");
 export const DEFAULT_AUDIO_SCRIPT = resolve(HERE, "../../../media-use/audio/scripts/audio.mjs");
+
+const TERMINAL_MINIMAX_CODES = new Set(["failed", "cancelled", "expired"]);
 
 export class PipelineCommandError extends Error {
   constructor(
@@ -59,10 +60,8 @@ function parseJsonOutput(stdout) {
 
 function taskIdFromText(value) {
   const text = String(value || "");
-  const match =
-    /(?:task[_ -]?id|task)\s*(?:=|:|is)?\s*["']?([A-Za-z0-9_-]{4,})/i.exec(text) ||
-    /\bpaid-task\b/i.exec(text);
-  return match?.[1] || match?.[0] || null;
+  const match = /(?:task[_ -]?id|task)\s*(?:=|:|is)?\s*["']?([A-Za-z0-9_-]{4,})/i.exec(text);
+  return match?.[1] || null;
 }
 
 export function runNodeJson(
@@ -140,7 +139,12 @@ export function sceneGenerationIntent(plan, scene) {
     .join(" ");
 }
 
-export function sceneProviderEnv(plan, scene, baseEnv = process.env, { workerSlot = 0 } = {}) {
+export function sceneProviderEnv(
+  plan,
+  scene,
+  baseEnv = process.env,
+  { workerSlot = 0, resumeTaskId = null } = {},
+) {
   const env = { ...baseEnv };
   if (scene.provider === "comfyui") {
     const fps = 24;
@@ -157,6 +161,8 @@ export function sceneProviderEnv(plan, scene, baseEnv = process.env, { workerSlo
     env.MINIMAX_H3_DURATION = String(miniMaxDurationForScene(scene.duration_s));
     env.MINIMAX_H3_RATIO = plan.video.height > plan.video.width ? "9:16" : "16:9";
     env.MINIMAX_H3_NEGATIVE_PROMPT = scene.negative_prompt;
+    if (resumeTaskId) env.MINIMAX_H3_RESUME_TASK_ID = String(resumeTaskId);
+    else delete env.MINIMAX_H3_RESUME_TASK_ID;
   }
   return env;
 }
@@ -214,7 +220,8 @@ function absoluteAsset(projectDir, assetPath) {
 
 function isNonEmptyFile(path) {
   try {
-    return statSync(path).isFile() && statSync(path).size > 0;
+    const stat = statSync(path);
+    return stat.isFile() && stat.size > 0;
   } catch {
     return false;
   }
@@ -223,6 +230,8 @@ function isNonEmptyFile(path) {
 function existingSceneRecord(record, projectDir, inputHash) {
   return (
     record &&
+    record.status !== "pending_remote" &&
+    record.status !== "failed_remote" &&
     record.input_hash === inputHash &&
     typeof record.path === "string" &&
     isNonEmptyFile(absoluteAsset(projectDir, record.path))
@@ -247,11 +256,7 @@ function configuredWorkflow(projectDir, env) {
 export function sceneProviderFingerprint(
   plan,
   scene,
-  {
-    projectDir,
-    env = process.env,
-    workerSlot = 0,
-  } = {},
+  { projectDir, env = process.env, workerSlot = 0 } = {},
 ) {
   const providerEnv = sceneProviderEnv(plan, scene, env, { workerSlot });
   if (scene.provider === "comfyui") {
@@ -335,6 +340,23 @@ function writeManifestAtomic(path, value) {
   }
 }
 
+function miniMaxCheckpointRecord(scene, inputHash, error, status) {
+  return {
+    id: scene.id,
+    status,
+    requested_provider: "minimax",
+    provider: "minimax",
+    task_id: error.taskId,
+    target_duration_s: scene.duration_s,
+    native_audio: "mute",
+    native_audio_requested: scene.native_audio,
+    input_hash: inputHash,
+    error_code: error.code || null,
+    error_message: error.message,
+    updated_at: new Date().toISOString(),
+  };
+}
+
 export async function generateVisuals(
   plan,
   {
@@ -383,16 +405,41 @@ export async function generateVisuals(
         height: plan.video.height,
         runtime_fingerprints: runtimeFingerprints,
       });
-      if (!force && existingSceneRecord(records[scene.id], projectDir, inputHash)) {
-        onProgress({ type: "skip", scene, index, record: records[scene.id] });
-        return records[scene.id];
+      const previousRecord = records[scene.id];
+      if (!force && existingSceneRecord(previousRecord, projectDir, inputHash)) {
+        onProgress({ type: "skip", scene, index, record: previousRecord });
+        return previousRecord;
+      }
+      if (
+        !force &&
+        previousRecord?.status === "failed_remote" &&
+        previousRecord.input_hash === inputHash
+      ) {
+        throw new PipelineCommandError(
+          `scene ${scene.id} has a terminal MiniMax task failure (${previousRecord.task_id}); pass --force only after deciding to submit a new paid task`,
+          {
+            code: previousRecord.error_code || "failed_remote",
+            taskId: previousRecord.task_id,
+          },
+        );
       }
 
+      const resumableTaskId =
+        previousRecord?.status === "pending_remote" && previousRecord.input_hash === inputHash
+          ? previousRecord.task_id
+          : null;
       let lastError;
       for (const provider of providers) {
         const candidate = { ...scene, provider };
         const workerSlot = provider === "comfyui" ? comfyOrdinal : 0;
-        onProgress({ type: "start", scene: candidate, index, workerSlot });
+        const providerResumeTaskId = provider === "minimax" ? resumableTaskId : null;
+        onProgress({
+          type: providerResumeTaskId ? "resume" : "start",
+          scene: candidate,
+          index,
+          workerSlot,
+          taskId: providerResumeTaskId,
+        });
         try {
           const payload = await runJson(
             resolveScript,
@@ -409,19 +456,29 @@ export async function generateVisuals(
             ],
             {
               cwd: projectDir,
-              env: sceneProviderEnv(plan, candidate, env, { workerSlot }),
+              env: sceneProviderEnv(plan, candidate, env, {
+                workerSlot,
+                resumeTaskId: providerResumeTaskId,
+              }),
             },
           );
           if (!payload.path) throw new Error("media-use returned no frozen asset path");
           const actualProvider = providerFamily(payload.provenance?.provider || provider);
+          const nativeAudioVerified = payload.provenance?.native_audio === true;
           const record = {
             id: scene.id,
+            status: "complete",
             requested_provider: provider,
             provider: actualProvider,
             path: payload.path,
             source_duration_s: payload.duration ?? null,
             target_duration_s: scene.duration_s,
-            native_audio: scene.native_audio,
+            native_audio_requested: scene.native_audio,
+            native_audio:
+              scene.native_audio !== "mute" && nativeAudioVerified
+                ? scene.native_audio
+                : "mute",
+            has_native_audio: nativeAudioVerified,
             ...(actualProvider === "comfyui" && {
               worker_slot: workerSlot % comfyPoolSize,
               worker_pool_size: comfyPoolSize,
@@ -440,11 +497,22 @@ export async function generateVisuals(
           return record;
         } catch (error) {
           lastError = error;
+          error.sceneId ||= scene.id;
           onProgress({ type: "provider-failed", scene: candidate, index, error });
-          // Explicit MiniMax is paid. Any transport failure during task creation
-          // is ambiguous, even without a task ID, so never invoke another video
-          // provider automatically after an H3 attempt.
-          if (provider === "minimax" || error?.taskId) throw error;
+          if (provider === "minimax" || error?.taskId) {
+            if (error?.taskId) {
+              const status = TERMINAL_MINIMAX_CODES.has(String(error.code || "").toLowerCase())
+                ? "failed_remote"
+                : "pending_remote";
+              records[scene.id] = miniMaxCheckpointRecord(scene, inputHash, error, status);
+              writeManifestAtomic(manifestPath, {
+                version: 1,
+                plan_hash: stableHash(plan),
+                scenes: records,
+              });
+            }
+            throw error;
+          }
         }
       }
       throw new Error(
@@ -483,7 +551,10 @@ export function buildAudioRequest(plan) {
 }
 
 export function approximateWordTimings(text, durationS) {
-  const words = String(text || "").trim().split(/\s+/).filter(Boolean);
+  const words = String(text || "")
+    .trim()
+    .split(/\s+/)
+    .filter(Boolean);
   if (!words.length || !(durationS > 0)) return [];
   const weights = words.map((word) => Math.max(1, word.replace(/[^\p{L}\p{N}]/gu, "").length));
   const total = weights.reduce((sum, weight) => sum + weight, 0);
@@ -511,9 +582,10 @@ export function normalizeAudioMeta(plan, meta) {
     if (!voice) throw new Error(`Gemini TTS produced no voice asset for scene ${scene.id}`);
     const duration = Number(voice.duration_s);
     if (!(duration > 0)) throw new Error(`voice asset for scene ${scene.id} has no valid duration`);
-    const words = Array.isArray(voice.words) && voice.words.length
-      ? voice.words
-      : approximateWordTimings(scene.narration, duration);
+    const words =
+      Array.isArray(voice.words) && voice.words.length
+        ? voice.words
+        : approximateWordTimings(scene.narration, duration);
     normalized.push({ ...voice, id: scene.id, words });
   }
   return {
