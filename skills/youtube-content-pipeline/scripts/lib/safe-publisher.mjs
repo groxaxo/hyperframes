@@ -38,7 +38,18 @@ function packageFiles(packageDir) {
 
 function assertPackage(files) {
   for (const [name, path] of Object.entries(files)) {
-    if (!nonEmpty(path)) throw new YouTubeApiError(`YouTube package ${name} is missing or empty: ${path}`);
+    if (!nonEmpty(path))
+      throw new YouTubeApiError(`YouTube package ${name} is missing or empty: ${path}`);
+  }
+}
+
+function captionsContainCues(path) {
+  try {
+    return /\d{2}:\d{2}:\d{2},\d{3}\s+-->\s+\d{2}:\d{2}:\d{2},\d{3}/.test(
+      readFileSync(path, "utf8"),
+    );
+  } catch {
+    return false;
   }
 }
 
@@ -122,12 +133,13 @@ export async function findYouTubeCaption(
 }
 
 function checkpointError(error, checkpoint, stage) {
-  const wrapped = error instanceof YouTubeApiError
-    ? error
-    : new YouTubeApiError(`${stage} failed: ${error?.message || error}`, {
-        code: `${stage}_failed`,
-        retryable: true,
-      });
+  const wrapped =
+    error instanceof YouTubeApiError
+      ? error
+      : new YouTubeApiError(`${stage} failed: ${error?.message || error}`, {
+          code: `${stage}_failed`,
+          retryable: true,
+        });
   wrapped.videoId = checkpoint.video_id || wrapped.videoId || null;
   wrapped.sessionUrl = checkpoint.upload_session || wrapped.sessionUrl || null;
   wrapped.publishStage = stage;
@@ -165,11 +177,13 @@ export async function publishYouTubePackageSafely(
 ) {
   const files = packageFiles(packageDir);
   assertPackage(files);
+  const hasCaptionCues = captionsContainCues(files.captions);
   const resource = buildYouTubeVideoResource(plan, privacy);
   const preview = {
     dry_run: Boolean(dryRun),
     files: Object.fromEntries(Object.entries(files).map(([key, path]) => [key, basename(path)])),
     resource,
+    captions_will_upload: hasCaptionCues,
   };
   if (dryRun) return preview;
 
@@ -186,9 +200,16 @@ export async function publishYouTubePackageSafely(
     upload_session: resume.sessionUrl || (previousMatches ? previous.upload_session : null) || null,
     video_id: resume.videoId || (previousMatches ? previous.video_id : null) || null,
     watch_url: null,
-    video_upload_complete: Boolean(resume.videoId || (previousMatches && previous.video_upload_complete)),
+    video_upload_complete: Boolean(
+      resume.videoId || (previousMatches && previous.video_upload_complete),
+    ),
     thumbnail_set: Boolean(resume.thumbnailSet || (previousMatches && previous.thumbnail_set)),
     caption_id: resume.captionId || (previousMatches ? previous.caption_id : null) || null,
+    captions_skipped: Boolean(
+      resume.captionsSkipped ||
+        (previousMatches && previous.captions_skipped) ||
+        !hasCaptionCues,
+    ),
     publish_complete: false,
     updated_at: new Date().toISOString(),
   };
@@ -271,7 +292,12 @@ export async function publishYouTubePackageSafely(
     }
   }
 
-  if (!checkpoint.caption_id) {
+  if (!hasCaptionCues && !checkpoint.captions_skipped) {
+    checkpoint.captions_skipped = true;
+  }
+  if (checkpoint.captions_skipped) {
+    if (checkpoint.stage !== "captions_skipped") await persist("captions_skipped");
+  } else if (!checkpoint.caption_id) {
     const captionName = plan.video.language;
     try {
       const existing = await findYouTubeCaption(
@@ -308,9 +334,10 @@ export async function publishYouTubePackageSafely(
   }
 
   checkpoint.publish_complete = true;
-  checkpoint.published_at = previousMatches && previous?.published_at
-    ? previous.published_at
-    : new Date().toISOString();
+  checkpoint.published_at =
+    previousMatches && previous?.published_at
+      ? previous.published_at
+      : new Date().toISOString();
   await persist("complete");
   return checkpoint;
 }
