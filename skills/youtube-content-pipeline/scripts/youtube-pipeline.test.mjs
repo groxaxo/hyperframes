@@ -3,8 +3,9 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { createInitialPlan, main, preflight, stagesThrough } from "./youtube-pipeline.mjs";
 import { completeStage, emptyState, writeState } from "./lib/state.mjs";
+import { validatePlan } from "./lib/plan.mjs";
+import { createInitialPlan, main, preflight, stagesThrough } from "./youtube-pipeline.mjs";
 
 test("initial plan remains hybrid and does not introduce a paid H3 call by default", () => {
   const plan = createInitialPlan("How missed calls cost tradies money", "long");
@@ -90,17 +91,26 @@ test("status exposes stale state when a completed artifact has disappeared", asy
   const logs = [];
   t.mock.method(console, "log", (value) => logs.push(value));
   try {
-    const plan = createInitialPlan("Artifact integrity", "long");
-    plan.video.description = "Researched.";
-    writeFileSync(join(dir, "youtube-plan.json"), `${JSON.stringify(plan, null, 2)}\n`);
+    const raw = createInitialPlan("Artifact integrity", "long");
+    raw.video.description = "Researched.";
+    const validation = validatePlan(raw);
+    writeFileSync(join(dir, "youtube-plan.json"), `${JSON.stringify(raw, null, 2)}\n`);
     mkdirSync(join(dir, ".youtube-pipeline"), { recursive: true });
-    writeFileSync(join(dir, ".youtube-pipeline/normalized-plan.json"), JSON.stringify(plan));
+    writeFileSync(
+      join(dir, ".youtube-pipeline/normalized-plan.json"),
+      JSON.stringify(validation.plan),
+    );
     writeFileSync(
       join(dir, ".youtube-pipeline/scenes.json"),
       JSON.stringify({ scenes: { hook: { path: "assets/video/hook.mp4" } } }),
     );
-    let state = emptyState("hash");
-    state = completeStage(state, "visuals", { scene_manifest: ".youtube-pipeline/scenes.json" }, "visual-hash");
+    let state = emptyState(validation.hash);
+    state = completeStage(
+      state,
+      "visuals",
+      { scene_manifest: ".youtube-pipeline/scenes.json" },
+      "visual-hash",
+    );
     writeState(join(dir, ".youtube-pipeline/state.json"), state);
 
     await main(["status", "--project", dir, "--json"]);
