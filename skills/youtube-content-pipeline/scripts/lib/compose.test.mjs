@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import {
+  applyVerifiedMediaCapabilities,
   buildCaptionGroups,
   buildMainHtml,
   buildNormalizeVideoArgs,
@@ -75,12 +76,50 @@ function audio() {
   };
 }
 
+function visualManifest({ verifiedHookAudio = true } = {}) {
+  return {
+    scenes: {
+      hook: {
+        path: "assets/video/hook.mp4",
+        provider: "gemini",
+        native_audio_requested: "duck",
+        native_audio: verifiedHookAudio ? "duck" : "mute",
+        has_native_audio: verifiedHookAudio,
+      },
+      broll: {
+        path: "assets/video/broll.mp4",
+        provider: "comfyui",
+        native_audio_requested: "mute",
+        native_audio: "mute",
+        has_native_audio: false,
+      },
+    },
+  };
+}
+
 test("schedule extends only the scene whose narration exceeds its shot budget", () => {
   const schedule = buildSchedule(plan(), audio());
   assert.equal(schedule.scenes[0].duration_s, 3.8);
   assert.equal(schedule.scenes[1].start_s, 3.8);
   assert.equal(schedule.scenes[1].duration_s, 4);
   assert.equal(schedule.total_duration_s, 7.8);
+});
+
+test("verified media capabilities mute native audio unless its stream is confirmed", () => {
+  const verified = applyVerifiedMediaCapabilities(
+    buildSchedule(plan(), audio()),
+    visualManifest({ verifiedHookAudio: true }),
+  );
+  assert.equal(verified.scenes[0].native_audio, "duck");
+  assert.equal(verified.scenes[0].native_audio_verified, true);
+
+  const unverified = applyVerifiedMediaCapabilities(
+    buildSchedule(plan(), audio()),
+    visualManifest({ verifiedHookAudio: false }),
+  );
+  assert.equal(unverified.scenes[0].native_audio_requested, "duck");
+  assert.equal(unverified.scenes[0].native_audio, "mute");
+  assert.equal(unverified.scenes[0].native_audio_verified, false);
 });
 
 test("normalization command pads, trims, removes audio, and emits YouTube-safe H.264", () => {
@@ -110,8 +149,11 @@ test("caption groups use global scene offsets and serialize to SRT/VTT", () => {
   assert.match(captionsToVtt(groups), /^WEBVTT/);
 });
 
-test("main composition uses muted video, separate voice/native audio, and captions", () => {
-  const schedule = buildSchedule(plan(), audio());
+test("main composition uses muted video, separate verified audio, and captions", () => {
+  const schedule = applyVerifiedMediaCapabilities(
+    buildSchedule(plan(), audio()),
+    visualManifest(),
+  );
   const normalized = {
     hook: { path: "assets/video/hook.mp4", normalized_path: "assets/youtube/scenes/hook.mp4" },
     broll: { path: "assets/video/broll.mp4", normalized_path: "assets/youtube/scenes/broll.mp4" },
@@ -125,6 +167,19 @@ test("main composition uses muted video, separate voice/native audio, and captio
   assert.match(html, /window\.__timelines\.main = tl/);
 });
 
+test("main composition never mounts requested but unverified native audio", () => {
+  const schedule = applyVerifiedMediaCapabilities(
+    buildSchedule(plan(), audio()),
+    visualManifest({ verifiedHookAudio: false }),
+  );
+  const normalized = {
+    hook: { path: "assets/video/hook.mp4", normalized_path: "assets/youtube/scenes/hook.mp4" },
+    broll: { path: "assets/video/broll.mp4", normalized_path: "assets/youtube/scenes/broll.mp4" },
+  };
+  const html = buildMainHtml(plan(), schedule, normalized, audio());
+  assert.doesNotMatch(html, /id="native-hook"/);
+});
+
 test("composeProject writes an editable HyperFrames project and thumbnail subproject", () => {
   const dir = mkdtempSync(join(tmpdir(), "youtube-compose-"));
   try {
@@ -134,24 +189,21 @@ test("composeProject writes an editable HyperFrames project and thumbnail subpro
     writeFileSync(join(dir, "assets/video/broll.mp4"), "broll");
     writeFileSync(join(dir, "assets/voice/hook.wav"), "voice");
     writeFileSync(join(dir, "assets/voice/broll.wav"), "voice");
-    const visual = {
-      scenes: {
-        hook: { path: "assets/video/hook.mp4", provider: "gemini" },
-        broll: { path: "assets/video/broll.mp4", provider: "comfyui" },
-      },
-    };
     const fakeSpawn = (_bin, args) => {
       const output = args.at(-1);
       mkdirSync(join(output, ".."), { recursive: true });
       writeFileSync(output, "generated");
       return { status: 0, stdout: "", stderr: "" };
     };
-    const result = composeProject(plan(), visual, audio(), {
+    const result = composeProject(plan(), visualManifest(), audio(), {
       projectDir: dir,
       force: true,
       spawnSync: fakeSpawn,
     });
     assert.equal(result.schedule.total_duration_s, 7.8);
+    assert.equal(result.composition.expected_audio, true);
+    assert.equal(result.composition.audio.voice_count, 2);
+    assert.equal(result.composition.audio.verified_native_audio_count, 1);
     for (const path of [
       "index.html",
       "compositions/captions.html",
@@ -192,17 +244,10 @@ test("a rerun never reuses a stale normalized clip merely because the output pat
       writeFileSync(output, "fresh");
       return { status: 0, stdout: "", stderr: "" };
     };
-    composeProject(
-      plan(),
-      {
-        scenes: {
-          hook: { path: "assets/video/hook.mp4", provider: "gemini" },
-          broll: { path: "assets/video/broll.mp4", provider: "comfyui" },
-        },
-      },
-      audio(),
-      { projectDir: dir, spawnSync: fakeSpawn },
-    );
+    composeProject(plan(), visualManifest(), audio(), {
+      projectDir: dir,
+      spawnSync: fakeSpawn,
+    });
     assert.ok(calls.filter((args) => args.includes("-c:v")).length >= 2);
     assert.equal(readFileSync(join(dir, "assets/youtube/scenes/hook.mp4"), "utf8"), "fresh");
   } finally {
