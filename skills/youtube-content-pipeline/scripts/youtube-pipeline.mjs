@@ -12,10 +12,17 @@ import {
 import { dirname, join, relative, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { parseArgs } from "node:util";
+import {
+  compositionInputFingerprint,
+  packageUploadFingerprint,
+  stageArtifactsCurrent,
+  workflowFingerprint,
+} from "./lib/artifact-guards.mjs";
 import { composeProject, readCompositionManifest } from "./lib/compose.mjs";
 import { generateAudio, generateVisuals } from "./lib/media-runner.mjs";
 import { packageYouTubeProject, renderProject } from "./lib/package.mjs";
 import { PRIVACY_VALUES, readPlan, slugify, stableHash } from "./lib/plan.mjs";
+import { publishYouTubePackageSafely } from "./lib/safe-publisher.mjs";
 import {
   STAGES,
   beginStage,
@@ -25,7 +32,7 @@ import {
   stageIsCurrent,
   writeState,
 } from "./lib/state.mjs";
-import { publishYouTubePackage, youtubeCredentialStatus } from "./lib/youtube-api.mjs";
+import { youtubeCredentialStatus } from "./lib/youtube-api.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const TEMPLATE_PATH = resolve(HERE, "../templates/youtube-plan.example.json");
@@ -87,6 +94,7 @@ function parseCli(argv) {
       through: { type: "string", default: "compose" },
       privacy: { type: "string" },
       resume: { type: "boolean", default: true },
+      "no-resume": { type: "boolean", default: false },
       force: { type: "boolean", default: false },
       "dry-run": { type: "boolean", default: false },
       "skip-check": { type: "boolean", default: false },
@@ -94,6 +102,7 @@ function parseCli(argv) {
       help: { type: "boolean", short: "h", default: false },
     },
   });
+  if (values["no-resume"]) values.resume = false;
   return { command: values.help ? "help" : command, args: values };
 }
 
@@ -113,7 +122,7 @@ Commands:
   render      Run hyperframes check, render high quality, and verify the MP4
   package     Create youtube-package/ with video, thumbnail, captions and metadata
   publish     Dry-run or upload privately/unlisted/public via YouTube Data API
-  status      Show resumable stage state and provider allocation
+  status      Show resumable stage state, artifact integrity and provider allocation
   run         Execute stages in order through compose|render|package|publish
 
 Options:
@@ -123,6 +132,7 @@ Options:
   --through <stage>    Last stage for run (default: compose)
   --privacy <value>    private|unlisted|public for publish
   --resume             Reuse completed scene/stage artifacts (default)
+  --no-resume          Rebuild the selected stage even when state is current
   --force              Rebuild the selected stage
   --dry-run            Validate publishing payload without OAuth/network
   --skip-check          Render without the HyperFrames browser gate (not recommended)
@@ -304,38 +314,116 @@ function readPipelineState(paths, planHash = null) {
 
 function persistPlanStage(paths, validation) {
   let state = readPipelineState(paths, validation.hash);
-  if (!stageIsCurrent(state, "plan", validation.hash)) {
-    state = completeStage(state, "plan", { normalized_plan: relative(paths.projectDir, paths.normalizedPlan) }, validation.hash);
+  if (!stageIsCurrent(state, "plan", validation.hash) || !stageArtifactsCurrent("plan", paths)) {
+    state = completeStage(
+      state,
+      "plan",
+      { normalized_plan: relative(paths.projectDir, paths.normalizedPlan) },
+      validation.hash,
+    );
     state.plan_hash = validation.hash;
     writeState(paths.state, state);
   }
   return state;
 }
 
-async function executeStage(paths, validation, name, inputHash, worker, { force = false } = {}) {
+function checkpointArtifacts(checkpoint, inputHash) {
+  return {
+    youtube_upload_input_hash: inputHash,
+    youtube_upload_session: checkpoint.upload_session || null,
+    youtube_video_id: checkpoint.video_id || null,
+    youtube_watch_url: checkpoint.watch_url || null,
+    youtube_thumbnail_set: Boolean(checkpoint.thumbnail_set),
+    youtube_caption_id: checkpoint.caption_id || null,
+    youtube_publish_stage: checkpoint.stage || null,
+    publish_receipt: "youtube-package/publish-receipt.json",
+  };
+}
+
+async function executeStage(paths, validation, name, inputHash, worker, options = {}) {
+  const force = Boolean(options.force || options.resume === false);
   let state = persistPlanStage(paths, validation);
-  if (!force && stageIsCurrent(state, name, inputHash)) {
+  if (
+    !force &&
+    stageIsCurrent(state, name, inputHash) &&
+    stageArtifactsCurrent(name, paths)
+  ) {
     return { skipped: true, state, result: null };
   }
   state = beginStage(state, name, inputHash);
   writeState(paths.state, state);
   try {
     const result = await worker();
+    // A long-running worker may have persisted checkpoints. Re-read before
+    // marking complete so those artifacts are never overwritten by stale state.
+    state = readPipelineState(paths, validation.hash);
     state = completeStage(state, name, result?.artifacts || {}, inputHash);
     writeState(paths.state, state);
     return { skipped: false, state, result };
   } catch (error) {
+    state = readPipelineState(paths, validation.hash);
     state = failStage(state, name, error);
-    if (error?.sessionUrl) {
-      state.artifacts = { ...state.artifacts, youtube_upload_session: error.sessionUrl };
+    if (error?.checkpoint) {
+      state.artifacts = {
+        ...state.artifacts,
+        ...checkpointArtifacts(error.checkpoint, inputHash),
+      };
+    } else {
+      if (error?.sessionUrl) {
+        state.artifacts = { ...state.artifacts, youtube_upload_session: error.sessionUrl };
+      }
+      if (error?.videoId) {
+        state.artifacts = {
+          ...state.artifacts,
+          youtube_video_id: error.videoId,
+          youtube_watch_url: `https://www.youtube.com/watch?v=${error.videoId}`,
+        };
+      }
     }
     writeState(paths.state, state);
     throw error;
   }
 }
 
+function visualRuntimeFingerprint(plan, projectDir, env = process.env) {
+  return stableHash({
+    workflow: workflowFingerprint(projectDir, env),
+    comfyui: {
+      model: env.COMFYUI_LTX23_MODEL || null,
+      bindings: env.COMFYUI_LTX23_BINDINGS_JSON || null,
+      width: env.COMFYUI_LTX23_WIDTH || null,
+      height: env.COMFYUI_LTX23_HEIGHT || null,
+      fps: env.COMFYUI_LTX23_FPS || null,
+    },
+    gemini: {
+      model: env.GEMINI_VIDEO_MODEL || "gemini-omni-flash-preview",
+    },
+    minimax: {
+      host: env.MINIMAX_API_HOST || env.MINIMAX_API_BASE_URL || "global",
+      resolution: env.MINIMAX_H3_RESOLUTION || "2K",
+      first_frame: env.MINIMAX_H3_FIRST_FRAME || null,
+      last_frame: env.MINIMAX_H3_LAST_FRAME || null,
+      reference_images: env.MINIMAX_H3_REFERENCE_IMAGES_JSON || null,
+      reference_videos: env.MINIMAX_H3_REFERENCE_VIDEOS_JSON || null,
+      reference_audios: env.MINIMAX_H3_REFERENCE_AUDIOS_JSON || null,
+    },
+    scenes: plan.scenes.map((scene) => ({
+      id: scene.id,
+      provider: scene.provider,
+      fallback_provider: scene.fallback_provider,
+      duration_s: scene.duration_s,
+      negative_prompt: scene.negative_prompt,
+    })),
+  });
+}
+
 async function runVisualsStage(paths, validation, args) {
-  const inputHash = stableHash({ plan_hash: validation.hash, scenes: validation.plan.scenes, video: validation.plan.video });
+  const inputHash = stableHash({
+    plan_hash: validation.hash,
+    scenes: validation.plan.scenes,
+    video: validation.plan.video,
+    runtime: visualRuntimeFingerprint(validation.plan, paths.projectDir),
+  });
   return executeStage(
     paths,
     validation,
@@ -344,7 +432,7 @@ async function runVisualsStage(paths, validation, args) {
     async () => {
       const generated = await generateVisuals(validation.plan, {
         projectDir: paths.projectDir,
-        force: args.force,
+        force: args.force || args.resume === false,
         onProgress: (event) => {
           if (args.json) return;
           if (event.type === "start") console.error(`· visuals: ${event.scene.id} with ${event.scene.provider}`);
@@ -364,9 +452,11 @@ async function runVisualsStage(paths, validation, args) {
 async function runAudioStage(paths, validation, args) {
   const inputHash = stableHash({
     plan_hash: validation.hash,
+    model: process.env.GEMINI_TTS_MODEL || "gemini-3.1-flash-tts-preview",
     voice: validation.plan.production.gemini_voice,
     scenes: validation.plan.scenes.map((scene) => ({ id: scene.id, narration: scene.narration })),
     bgm: validation.plan.production.background_music,
+    bgm_query: validation.plan.production.background_music_query,
   });
   return executeStage(
     paths,
@@ -407,7 +497,7 @@ async function runComposeStage(paths, validation, args) {
         readJson(paths.audio, "audio metadata"),
         {
           projectDir: paths.projectDir,
-          force: args.force,
+          force: args.force || args.resume === false,
           onProgress: (event) => {
             if (!args.json && event.type === "start") console.error(`· compose: normalize ${event.scene.id}`);
           },
@@ -429,7 +519,11 @@ async function runComposeStage(paths, validation, args) {
 async function runRenderStage(paths, validation, args) {
   if (!existsSync(paths.composition)) throw new Error("compose stage is incomplete: composition.json is missing");
   const composition = readCompositionManifest(paths.projectDir);
-  const inputHash = stableHash({ composition: hashFile(paths.composition), skip_check: args["skip-check"] });
+  const inputHash = stableHash({
+    composition: hashFile(paths.composition),
+    source_files: compositionInputFingerprint(paths.projectDir, composition),
+    skip_check: args["skip-check"],
+  });
   return executeStage(
     paths,
     validation,
@@ -456,8 +550,10 @@ async function runPackageStage(paths, validation, args) {
   const inputHash = stableHash({
     plan_hash: validation.hash,
     composition: hashFile(paths.composition),
-    video_size: statSync(paths.render).size,
-    video_mtime_ms: statSync(paths.render).mtimeMs,
+    rendered_video: hashFile(paths.render),
+    captions_srt: hashFile(join(paths.projectDir, "captions.srt")),
+    captions_vtt: hashFile(join(paths.projectDir, "captions.vtt")),
+    thumbnail_source: compositionInputFingerprint(paths.projectDir, composition)[0] || null,
   });
   return executeStage(
     paths,
@@ -469,7 +565,7 @@ async function runPackageStage(paths, validation, args) {
         projectDir: paths.projectDir,
         videoPath: paths.render,
         packageDir: paths.packageDir,
-        force: args.force,
+        force: args.force || args.resume === false,
       });
       return {
         ...result,
@@ -483,6 +579,28 @@ async function runPackageStage(paths, validation, args) {
   );
 }
 
+function persistPublishCheckpoint(paths, validation, inputHash, checkpoint) {
+  let state = readPipelineState(paths, validation.hash);
+  state = {
+    ...state,
+    stages: {
+      ...state.stages,
+      publish: {
+        ...(state.stages.publish || {}),
+        status: "running",
+        input_hash: inputHash,
+        checkpoint_stage: checkpoint.stage,
+        checkpoint_at: new Date().toISOString(),
+      },
+    },
+    artifacts: {
+      ...state.artifacts,
+      ...checkpointArtifacts(checkpoint, inputHash),
+    },
+  };
+  writeState(paths.state, state);
+}
+
 async function runPublishStage(paths, validation, args) {
   if (!existsSync(join(paths.packageDir, "metadata.json"))) {
     throw new Error("package stage is incomplete: youtube-package/metadata.json is missing");
@@ -490,20 +608,21 @@ async function runPublishStage(paths, validation, args) {
   const privacy = args.privacy || validation.plan.video.privacy || "private";
   if (!PRIVACY_VALUES.has(privacy)) throw new Error(`invalid privacy value: ${privacy}`);
 
+  const inputHash = stableHash({
+    plan_hash: validation.hash,
+    upload_files: packageUploadFingerprint(paths.packageDir),
+    privacy,
+  });
+
   if (args["dry-run"]) {
-    const preview = await publishYouTubePackage(validation.plan, paths.packageDir, {
+    const preview = await publishYouTubePackageSafely(validation.plan, paths.packageDir, {
       privacy,
       dryRun: true,
+      publishFingerprint: inputHash,
     });
     return { skipped: false, result: preview, state: readPipelineState(paths, validation.hash) };
   }
 
-  const inputHash = stableHash({
-    plan_hash: validation.hash,
-    metadata: hashFile(join(paths.packageDir, "metadata.json")),
-    video_size: statSync(join(paths.packageDir, "video.mp4")).size,
-    privacy,
-  });
   return executeStage(
     paths,
     validation,
@@ -511,18 +630,32 @@ async function runPublishStage(paths, validation, args) {
     inputHash,
     async () => {
       const currentState = readPipelineState(paths, validation.hash);
-      const published = await publishYouTubePackage(validation.plan, paths.packageDir, {
-        privacy,
-        dryRun: false,
-        sessionUrl: currentState.artifacts?.youtube_upload_session || null,
-      });
+      const canResume = currentState.artifacts?.youtube_upload_input_hash === inputHash;
+      const published = await publishYouTubePackageSafely(
+        validation.plan,
+        paths.packageDir,
+        {
+          privacy,
+          dryRun: false,
+          publishFingerprint: inputHash,
+          resume: canResume
+            ? {
+                sessionUrl: currentState.artifacts?.youtube_upload_session || null,
+                videoId: currentState.artifacts?.youtube_video_id || null,
+                thumbnailSet: currentState.artifacts?.youtube_thumbnail_set || false,
+                captionId: currentState.artifacts?.youtube_caption_id || null,
+              }
+            : {},
+          onCheckpoint: async (checkpoint) => {
+            persistPublishCheckpoint(paths, validation, inputHash, checkpoint);
+          },
+        },
+      );
       return {
         ...published,
         artifacts: {
-          youtube_video_id: published.video_id,
-          youtube_watch_url: published.watch_url,
-          publish_receipt: "youtube-package/publish-receipt.json",
-          youtube_upload_session: published.upload_session,
+          ...checkpointArtifacts(published, inputHash),
+          youtube_publish_complete: true,
         },
       };
     },
@@ -573,6 +706,7 @@ export function preflight(projectDir) {
   const geminiReady = Boolean(process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY);
   const comfyReady = Boolean(workflow && existsSync(workflow));
   const minimaxReady = Boolean(process.env.MINIMAX_API_KEY);
+  const minimaxResolution = process.env.MINIMAX_H3_RESOLUTION || "2K";
   const checks = [
     {
       name: "Node.js 22+",
@@ -598,15 +732,23 @@ export function preflight(projectDir) {
       name: "ComfyUI URL",
       ok: true,
       optional: !required.comfyui,
-      detail: process.env.COMFYUI_URL || "http://127.0.0.1:8188",
+      detail: process.env.COMFYUI_URL || process.env.COMFYUI_URLS || "http://127.0.0.1:8188",
     },
     {
       name: "MiniMax-H3 API key",
       ok: minimaxReady,
       optional: !required.minimax,
       detail: minimaxReady
-        ? `configured (${process.env.MINIMAX_API_HOST || "global"})`
+        ? `configured (${process.env.MINIMAX_API_HOST || "global"}, ${minimaxResolution})`
         : "set MINIMAX_API_KEY for minimax or tri-hybrid plans",
+    },
+    {
+      name: "MiniMax-H3 resolution",
+      ok: ["768P", "2K"].includes(minimaxResolution),
+      optional: !required.minimax,
+      detail: ["768P", "2K"].includes(minimaxResolution)
+        ? minimaxResolution
+        : `invalid: ${minimaxResolution} (expected 768P or 2K)`,
     },
   ];
   const youtube = youtubeCredentialStatus(process.env);
@@ -661,6 +803,9 @@ function statusReport(paths) {
     project: paths.projectDir,
     plan: validation ? planSummary(validation) : null,
     stages: state.stages,
+    artifact_integrity: Object.fromEntries(
+      STAGES.map((stage) => [stage, stageArtifactsCurrent(stage, paths)]),
+    ),
     artifacts: state.artifacts,
     actual_provider_split: providerSplit,
   };
@@ -709,7 +854,11 @@ export async function main(argv = process.argv.slice(2)) {
     if (args.json) console.log(JSON.stringify({ ok: true, ...report }, null, 2));
     else {
       console.log(`YouTube pipeline: ${projectDir}`);
-      for (const stage of STAGES) console.log(`  ${stage.padEnd(8)} ${report.stages[stage]?.status || "pending"}`);
+      for (const stage of STAGES) {
+        const status = report.stages[stage]?.status || "pending";
+        const integrity = report.artifact_integrity[stage] ? "artifacts-ok" : "artifacts-missing";
+        console.log(`  ${stage.padEnd(8)} ${status.padEnd(9)} ${integrity}`);
+      }
       if (Object.keys(report.actual_provider_split).length)
         console.log(`  providers ${JSON.stringify(report.actual_provider_split)}`);
     }
@@ -740,7 +889,11 @@ export async function main(argv = process.argv.slice(2)) {
   else if (parsed.command === "publish") stageResult = await runPublishStage(paths, validation, args);
   else if (parsed.command === "run") stageResult = await runThrough(paths, validation, args);
 
-  const value = { command: parsed.command, skipped: stageResult?.skipped || false, result: stageResult?.result || stageResult };
+  const value = {
+    command: parsed.command,
+    skipped: stageResult?.skipped || false,
+    result: stageResult?.result || stageResult,
+  };
   return emit(value, {
     json: args.json,
     lines: [
@@ -766,6 +919,10 @@ if (direct) {
             error: error?.message || String(error),
             code: error?.code || null,
             retryable: Boolean(error?.retryable),
+            task_id: error?.taskId || null,
+            session_url: error?.sessionUrl || null,
+            video_id: error?.videoId || null,
+            publish_stage: error?.publishStage || null,
           },
           null,
           2,
@@ -773,6 +930,9 @@ if (direct) {
       );
     } else {
       console.error(`✗ ${error?.message || error}`);
+      if (error?.taskId) console.error(`  MiniMax task id: ${error.taskId}`);
+      if (error?.videoId) console.error(`  YouTube video id: ${error.videoId}`);
+      if (error?.sessionUrl) console.error(`  upload session preserved for resume`);
     }
     process.exitCode = 1;
   });
