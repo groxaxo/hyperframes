@@ -62,15 +62,17 @@ test("first-frame, last-frame-only, and first-plus-last modes normalize ratio to
   assert.deepEqual(lastOnly.content.slice(1).map((item) => item.role), ["last_frame"]);
 });
 
-test("reference mode uses official H3 roles and accepts an explicit concrete ratio", () => {
+test("reference mode accepts arrays or JSON and uses official H3 roles", () => {
   const refs = buildMiniMaxH3Request(
     "Match the references",
-    { ratio: "21:9", resolution: "768P" },
     {
-      MINIMAX_H3_REFERENCE_IMAGES_JSON: '["https://example.com/ref.png"]',
-      MINIMAX_H3_REFERENCE_VIDEOS_JSON: '["https://example.com/ref.mp4"]',
-      MINIMAX_H3_REFERENCE_AUDIOS_JSON: '["https://example.com/ref.wav"]',
+      ratio: "21:9",
+      resolution: "768P",
+      referenceImages: ["https://example.com/ref.png"],
+      referenceVideos: ["https://example.com/ref.mp4"],
+      referenceAudios: ["https://example.com/ref.wav"],
     },
+    {},
   );
   assert.equal(refs.ratio, "21:9");
   assert.equal(refs.resolution, "768P");
@@ -143,9 +145,50 @@ test("provider writes a verified MP4 and records task provenance without assumin
     outputPath = result.localPath;
     assert.equal(result.metadata.provider, "minimax.h3");
     assert.equal(result.metadata.provenance.task_id, "task-output");
+    assert.equal(result.metadata.provenance.resumed, false);
     assert.equal(result.metadata.provenance.native_audio, "probe");
     assert.equal(existsSync(outputPath), true);
     assert.deepEqual(readFileSync(outputPath), bytes);
+  } finally {
+    if (outputPath) rmSync(outputPath, { force: true });
+  }
+});
+
+test("an existing H3 task resumes without creating another paid task", async () => {
+  let outputPath;
+  let createCalled = false;
+  let resumedTaskId = null;
+  try {
+    const result = await miniMaxH3Generate(
+      "Resume the existing launch film",
+      { provider: "minimax" },
+      {
+        env: {
+          MINIMAX_API_KEY: "secret",
+          MINIMAX_H3_RESUME_TASK_ID: "task-resume",
+        },
+        runVideo: async () => {
+          createCalled = true;
+          throw new Error("must not create");
+        },
+        resumeVideo: async (taskId) => {
+          resumedTaskId = taskId;
+          return {
+            taskId,
+            resumed: true,
+            task: { duration: 5, resolution: "2K", ratio: "16:9" },
+            bytes: mp4Bytes("resumed"),
+          };
+        },
+        pollIntervalMs: 0,
+        timeoutMs: 1_000,
+      },
+    );
+    outputPath = result.localPath;
+    assert.equal(createCalled, false);
+    assert.equal(resumedTaskId, "task-resume");
+    assert.equal(result.metadata.provenance.task_id, "task-resume");
+    assert.equal(result.metadata.provenance.resumed, true);
   } finally {
     if (outputPath) rmSync(outputPath, { force: true });
   }
@@ -171,6 +214,7 @@ test("invalid downloaded media preserves the paid task id", async () => {
       assert.ok(error instanceof MiniMaxH3ApiError);
       assert.equal(error.taskId, "paid-task");
       assert.equal(error.code, "invalid_video_container");
+      assert.match(error.message, /task_id: paid-task/);
       return true;
     },
   );
