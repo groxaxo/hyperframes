@@ -31,12 +31,12 @@ function response({ status = 200, json = {}, text = "", headers = {} } = {}) {
   };
 }
 
-function makePackage() {
+function makePackage({ captions = "1\n00:00:00,000 --> 00:00:01,000\nHello\n" } = {}) {
   const dir = mkdtempSync(join(tmpdir(), "youtube-safe-publish-"));
   for (const [name, data] of [
     ["video.mp4", "video"],
     ["thumbnail.jpg", "thumb"],
-    ["captions.srt", "captions"],
+    ["captions.srt", captions],
     ["metadata.json", "{}"],
   ]) writeFileSync(join(dir, name), data);
   return dir;
@@ -68,6 +68,7 @@ test("dry-run validates the package without OAuth or network", async () => {
     });
     assert.equal(result.dry_run, true);
     assert.equal(result.resource.status.privacyStatus, "private");
+    assert.equal(result.captions_will_upload, true);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -99,6 +100,7 @@ test("successful publishing checkpoints session, video, thumbnail, captions, and
     });
     assert.equal(result.video_id, "video123");
     assert.equal(result.caption_id, "caption123");
+    assert.equal(result.captions_skipped, false);
     assert.equal(result.publish_complete, true);
     assert.deepEqual(checkpoints, [
       "upload_session_created",
@@ -111,6 +113,35 @@ test("successful publishing checkpoints session, video, thumbnail, captions, and
     assert.equal(receipt.video_upload_complete, true);
     assert.equal(receipt.publish_complete, true);
     assert.equal(calls.filter((call) => call.url.includes("/videos?uploadType=resumable")).length, 1);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("a narration-free package skips caption APIs and still completes", async () => {
+  const dir = makePackage({ captions: "\n" });
+  const urls = [];
+  try {
+    const result = await publishYouTubePackageSafely(plan(), dir, {
+      env: { YOUTUBE_ACCESS_TOKEN: "token" },
+      publishFingerprint: "captionless",
+      fetch: async (url, options = {}) => {
+        urls.push(url);
+        await consumeBody(options.body);
+        if (url.includes("/videos?uploadType=resumable")) {
+          return response({ headers: { location: "https://upload.example/captionless" } });
+        }
+        if (url === "https://upload.example/captionless") {
+          return response({ status: 201, json: { id: "video-captionless" } });
+        }
+        if (url.includes("/thumbnails/set")) return response({ json: {} });
+        throw new Error(`unexpected URL: ${url}`);
+      },
+    });
+    assert.equal(result.captions_skipped, true);
+    assert.equal(result.caption_id, null);
+    assert.equal(result.publish_complete, true);
+    assert.equal(urls.some((url) => url.includes("/captions")), false);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
