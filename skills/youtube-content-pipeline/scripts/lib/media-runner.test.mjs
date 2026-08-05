@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import {
+  PipelineCommandError,
   approximateWordTimings,
   buildAudioRequest,
   comfyUiWorkerUrls,
@@ -15,6 +16,7 @@ import {
   runNodeJson,
   sceneGenerationIntent,
   sceneProviderEnv,
+  sceneProviderFingerprint,
 } from "./media-runner.mjs";
 
 function plan() {
@@ -69,6 +71,13 @@ function triPlan() {
   return value;
 }
 
+function writeVisual(dir, id, provider) {
+  const path = `assets/video/${id}.mp4`;
+  mkdirSync(join(dir, "assets/video"), { recursive: true });
+  writeFileSync(join(dir, path), provider);
+  return path;
+}
+
 test("LTX frames are always 8n+1 and cover the requested duration", () => {
   assert.equal(ltxFramesForDuration(5, 24), 121);
   assert.equal(ltxFramesForDuration(6, 24), 145);
@@ -116,13 +125,53 @@ test("ComfyUI worker pool accepts JSON or comma-separated URLs and rejects crede
   );
 });
 
-test("runNodeJson supports real asynchronous child processes", async () => {
+test("runNodeJson supports asynchronous children and preserves structured failure metadata", async () => {
   const payload = await runNodeJson("resolve.mjs", ["--json"], {
     execFile: (_bin, _args, _options, callback) => {
       setTimeout(() => callback(null, '{"ok":true,"path":"assets/video.mp4"}\n', ""), 5);
     },
   });
   assert.equal(payload.path, "assets/video.mp4");
+
+  await assert.rejects(
+    runNodeJson("resolve.mjs", ["--json"], {
+      execFile: (_bin, _args, _options, callback) => {
+        callback(
+          Object.assign(new Error("exit"), { code: 1 }),
+          '{"ok":false,"error":"poll timeout","code":"poll_timeout","retryable":true,"task_id":"task-123"}\n',
+          "",
+        );
+      },
+    }),
+    (error) => {
+      assert.ok(error instanceof PipelineCommandError);
+      assert.equal(error.code, "poll_timeout");
+      assert.equal(error.retryable, true);
+      assert.equal(error.taskId, "task-123");
+      return true;
+    },
+  );
+});
+
+test("provider fingerprints change when generation configuration changes", () => {
+  const dir = mkdtempSync(join(tmpdir(), "youtube-fingerprint-"));
+  try {
+    const workflow = join(dir, "ltx.json");
+    writeFileSync(workflow, '{"1":{"class_type":"A","inputs":{}}}');
+    const scene = plan().scenes[1];
+    const first = sceneProviderFingerprint(plan(), scene, {
+      projectDir: dir,
+      env: { COMFYUI_LTX23_WORKFLOW: workflow },
+    });
+    writeFileSync(workflow, '{"1":{"class_type":"B","inputs":{}}}');
+    const changed = sceneProviderFingerprint(plan(), scene, {
+      projectDir: dir,
+      env: { COMFYUI_LTX23_WORKFLOW: workflow },
+    });
+    assert.notEqual(first, changed);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 test("tri-hybrid generation invokes all three providers and persists a resumable manifest", async () => {
@@ -134,9 +183,7 @@ test("tri-hybrid generation invokes all three providers and persists a resumable
       runJson: async (_script, args) => {
         const provider = args[args.indexOf("--provider") + 1];
         const id = provider === "gemini" ? "hook" : provider === "comfyui" ? "broll" : "continuity";
-        const path = `assets/video/${id}.mp4`;
-        mkdirSync(join(dir, "assets/video"), { recursive: true });
-        writeFileSync(join(dir, path), provider);
+        const path = writeVisual(dir, id, provider);
         calls.push(provider);
         return {
           ok: true,
@@ -169,7 +216,37 @@ test("tri-hybrid generation invokes all three providers and persists a resumable
   }
 });
 
-test("a MiniMax task-id failure never falls through to a second provider", async () => {
+test("empty scene files are not treated as resumable assets", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "youtube-empty-visual-"));
+  try {
+    const value = plan();
+    value.production.provider_policy = "gemini";
+    value.scenes = [value.scenes[0]];
+    let calls = 0;
+    await generateVisuals(value, {
+      projectDir: dir,
+      runJson: async () => {
+        calls += 1;
+        const path = writeVisual(dir, "hook", "gemini");
+        return { path, provenance: { provider: "gemini.omni" } };
+      },
+    });
+    writeFileSync(join(dir, "assets/video/hook.mp4"), "");
+    await generateVisuals(value, {
+      projectDir: dir,
+      runJson: async () => {
+        calls += 1;
+        const path = writeVisual(dir, "hook", "gemini-regenerated");
+        return { path, provenance: { provider: "gemini.omni" } };
+      },
+    });
+    assert.equal(calls, 2);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("a MiniMax failure never falls through, even when task creation ended ambiguously", async () => {
   const dir = mkdtempSync(join(tmpdir(), "youtube-minimax-paid-"));
   const value = triPlan();
   value.scenes = [
@@ -186,14 +263,54 @@ test("a MiniMax task-id failure never falls through to a second provider", async
         projectDir: dir,
         runJson: async () => {
           calls += 1;
-          const error = new Error("polling timed out");
-          error.taskId = "paid-task";
-          throw error;
+          throw new PipelineCommandError("creation timed out", {
+            code: "timeout",
+            retryable: true,
+          });
         },
       }),
-      (error) => error.taskId === "paid-task",
+      /creation timed out/,
     );
     assert.equal(calls, 1);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("concurrent failure stops scheduling new scenes and waits for work already in flight", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "youtube-concurrency-failure-"));
+  const value = plan();
+  value.production.provider_policy = "gemini";
+  value.production.max_concurrency = 2;
+  value.scenes = Array.from({ length: 5 }, (_, index) => ({
+    ...value.scenes[0],
+    id: `scene-${index + 1}`,
+    visual_prompt: `scene ${index + 1}`,
+  }));
+  const started = [];
+  const finished = [];
+  try {
+    await assert.rejects(
+      generateVisuals(value, {
+        projectDir: dir,
+        runJson: async (_script, args) => {
+          const intent = args[args.indexOf("--intent") + 1];
+          const id = /scene (\d+)/.exec(intent)?.[1];
+          started.push(id);
+          if (id === "1") {
+            await new Promise((resolve) => setTimeout(resolve, 5));
+            throw new Error("first scene failed");
+          }
+          await new Promise((resolve) => setTimeout(resolve, 20));
+          finished.push(id);
+          const path = writeVisual(dir, `scene-${id}`, "gemini");
+          return { path, provenance: { provider: "gemini.omni" } };
+        },
+      }),
+      /first scene failed/,
+    );
+    assert.deepEqual(started.sort(), ["1", "2"]);
+    assert.deepEqual(finished, ["2"]);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
