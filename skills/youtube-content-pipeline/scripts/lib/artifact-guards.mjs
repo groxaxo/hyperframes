@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { existsSync, readFileSync, statSync } from "node:fs";
+import { readFileSync, statSync } from "node:fs";
 import { isAbsolute, join, resolve } from "node:path";
 
 export const YOUTUBE_PACKAGE_FILES = [
@@ -15,7 +15,8 @@ export const YOUTUBE_PACKAGE_FILES = [
 
 export function isNonEmptyFile(path) {
   try {
-    return statSync(path).isFile() && statSync(path).size > 0;
+    const stat = statSync(path);
+    return stat.isFile() && stat.size > 0;
   } catch {
     return false;
   }
@@ -44,9 +45,10 @@ function allPathsExist(projectDir, paths) {
 
 export function visualArtifactsCurrent(paths) {
   const manifest = readJsonIfValid(paths.visuals);
-  const scenes = manifest?.scenes && typeof manifest.scenes === "object"
-    ? Object.values(manifest.scenes)
-    : [];
+  const scenes =
+    manifest?.scenes && typeof manifest.scenes === "object"
+      ? Object.values(manifest.scenes)
+      : [];
   return scenes.length > 0 && allPathsExist(paths.projectDir, scenes.map((scene) => scene?.path));
 }
 
@@ -85,7 +87,13 @@ export function packageArtifactsCurrent(paths) {
 
 export function publishArtifactsCurrent(paths) {
   const receipt = readJsonIfValid(join(paths.packageDir, "publish-receipt.json"));
-  return Boolean(receipt?.video_id && receipt?.video_upload_complete);
+  return Boolean(
+    receipt?.video_id &&
+      receipt?.video_upload_complete &&
+      receipt?.thumbnail_set &&
+      receipt?.caption_id &&
+      receipt?.publish_complete,
+  );
 }
 
 export function stageArtifactsCurrent(name, paths) {
@@ -116,17 +124,21 @@ export function fingerprintFiles(projectDir, paths) {
 
 export function compositionInputFingerprint(projectDir, composition) {
   const files = composition?.files || {};
-  return fingerprintFiles(projectDir, [
-    files.index || "index.html",
-    files.captions_html || "compositions/captions.html",
-    ...Object.values(composition?.scenes || {}).flatMap((scene) => [
-      scene?.normalized_path,
-      scene?.path,
-    ]),
-    ...((composition?.schedule?.scenes || []).flatMap((scene) =>
-      scene?.voice_path ? [scene.voice_path] : []
-    )),
-  ].filter(Boolean));
+  const voicePaths = (composition?.schedule?.scenes || []).flatMap((scene) =>
+    scene?.voice_path ? [scene.voice_path] : [],
+  );
+  return fingerprintFiles(
+    projectDir,
+    [
+      files.index || "index.html",
+      files.captions_html || "compositions/captions.html",
+      ...Object.values(composition?.scenes || {}).flatMap((scene) => [
+        scene?.normalized_path,
+        scene?.path,
+      ]),
+      ...voicePaths,
+    ].filter(Boolean),
+  );
 }
 
 export function packageUploadFingerprint(packageDir) {
