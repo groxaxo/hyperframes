@@ -112,6 +112,18 @@ export function buildPackageMetadata(plan, composition) {
   };
 }
 
+function compositionExpectsAudio(expected) {
+  if (expected?.expected_audio === true) return true;
+  return Boolean(
+    expected?.schedule?.scenes?.some(
+      (scene) =>
+        scene?.voice_path ||
+        scene?.has_native_audio === true ||
+        (scene?.native_audio && scene.native_audio !== "mute" && scene?.native_audio_verified),
+    ),
+  );
+}
+
 export function verifyRenderedVideo(
   videoPath,
   expected,
@@ -128,7 +140,7 @@ export function verifyRenderedVideo(
       "-v",
       "error",
       "-show_entries",
-      "format=duration:stream=codec_type,codec_name,width,height",
+      "format=duration:stream=codec_type,codec_name,width,height,sample_rate,channels",
       "-of",
       "json",
       videoPath,
@@ -151,14 +163,30 @@ export function verifyRenderedVideo(
       `rendered duration ${round(duration)}s differs from composition ${expectedDuration}s by more than ${round(tolerance)}s`,
     );
   }
-  const video = (probe.streams || []).find((stream) => stream.codec_type === "video");
+
+  const streams = probe.streams || [];
+  const video = streams.find((stream) => stream.codec_type === "video");
   if (!video) throw new Error("rendered file contains no video stream");
   if (Number(video.width) !== Number(expected.width) || Number(video.height) !== Number(expected.height)) {
     throw new Error(
       `rendered dimensions ${video.width}x${video.height} do not match ${expected.width}x${expected.height}`,
     );
   }
-  return { duration_s: round(duration), video, probe };
+  if (video.codec_name && video.codec_name !== "h264") {
+    throw new Error(`rendered video codec is ${video.codec_name}; expected YouTube-safe h264`);
+  }
+
+  const audio = streams.find((stream) => stream.codec_type === "audio") || null;
+  if (compositionExpectsAudio(expected) && !audio) {
+    throw new Error("rendered file is silent even though the composition contains narration or verified native audio");
+  }
+  if (audio?.codec_name && audio.codec_name !== "aac") {
+    throw new Error(`rendered audio codec is ${audio.codec_name}; expected YouTube-safe aac`);
+  }
+  if (audio && Number(audio.channels) <= 0) {
+    throw new Error("rendered audio stream reports no channels");
+  }
+  return { duration_s: round(duration), video, audio, probe };
 }
 
 export function renderProject(
@@ -295,13 +323,16 @@ export function packageYouTubeProject(
     provider_split: metadata.provider_split,
     tts_provider: "gemini",
     scenes: Object.fromEntries(
-      Object.entries(composition.scenes || {}).map(([id, scene]) => [id, {
-        requested_provider: scene.requested_provider,
-        provider: scene.provider,
-        source_path: scene.path,
-        normalized_path: scene.normalized_path,
-        provenance: scene.provenance || {},
-      }]),
+      Object.entries(composition.scenes || {}).map(([id, scene]) => [
+        id,
+        {
+          requested_provider: scene.requested_provider,
+          provider: scene.provider,
+          source_path: scene.path,
+          normalized_path: scene.normalized_path,
+          provenance: scene.provenance || {},
+        },
+      ]),
     ),
   };
   writeFileSync(join(packageDir, "provenance.json"), `${JSON.stringify(provenance, null, 2)}\n`);
@@ -318,12 +349,15 @@ export function packageYouTubeProject(
   ];
   for (const file of files) {
     const path = join(packageDir, file);
-    if (!existsSync(path) || statSync(path).size === 0) throw new Error(`package file is empty: ${file}`);
+    if (!existsSync(path) || statSync(path).size === 0)
+      throw new Error(`package file is empty: ${file}`);
   }
   return {
     packageDir,
     files,
     metadata,
-    paths: Object.fromEntries(files.map((file) => [file, relative(projectDir, join(packageDir, file))])),
+    paths: Object.fromEntries(
+      files.map((file) => [file, relative(projectDir, join(packageDir, file))]),
+    ),
   };
 }

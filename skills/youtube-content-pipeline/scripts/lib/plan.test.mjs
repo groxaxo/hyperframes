@@ -1,6 +1,12 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { PlanValidationError, normalizePlan, slugify, stableHash, validatePlan } from "./plan.mjs";
+import {
+  PlanValidationError,
+  normalizePlan,
+  slugify,
+  stableHash,
+  validatePlan,
+} from "./plan.mjs";
 
 function basePlan() {
   return {
@@ -65,6 +71,37 @@ test("tri-hybrid normalization assigns Gemini, ComfyUI, and MiniMax", () => {
   );
 });
 
+test("tri-hybrid coverage never fixes one missing rung by deleting another", () => {
+  const raw = basePlan();
+  raw.production.provider_policy = "tri-hybrid";
+  raw.scenes = [
+    {
+      id: "one",
+      role: "broll",
+      duration_s: 5,
+      visual_prompt: "Scene one",
+    },
+    {
+      id: "two",
+      role: "broll",
+      duration_s: 5,
+      visual_prompt: "Scene two",
+    },
+    {
+      id: "three",
+      role: "broll",
+      duration_s: 5,
+      visual_prompt: "Scene three",
+    },
+  ];
+  const { plan } = validatePlan(raw);
+  assert.deepEqual(new Set(plan.scenes.map((scene) => scene.provider)), new Set([
+    "gemini",
+    "comfyui",
+    "minimax",
+  ]));
+});
+
 test("standalone MiniMax policy assigns every scene to H3", () => {
   const raw = basePlan();
   raw.production.provider_policy = "minimax";
@@ -93,14 +130,19 @@ test("tri-hybrid reports missing providers instead of rewriting explicit choices
   });
   for (const scene of raw.scenes) scene.provider = "gemini";
   const result = validatePlan(raw, { throwOnError: false });
-  assert.deepEqual(result.plan.scenes.map((scene) => scene.provider), ["gemini", "gemini", "gemini"]);
+  assert.deepEqual(result.plan.scenes.map((scene) => scene.provider), [
+    "gemini",
+    "gemini",
+    "gemini",
+  ]);
   assert.ok(result.errors.some((error) => /comfyui scene/.test(error)));
   assert.ok(result.errors.some((error) => /minimax scene/.test(error)));
 });
 
-test("MiniMax duration outside 4-15 seconds is visible as a composition warning", () => {
+test("MiniMax duration outside 4-15 seconds is visible for primary or fallback use", () => {
   const raw = basePlan();
-  raw.production.provider_policy = "minimax";
+  raw.production.provider_policy = "hybrid";
+  raw.scenes[0].fallback_provider = "minimax";
   raw.scenes[0].duration_s = 20;
   const result = validatePlan(raw);
   assert.ok(result.warnings.some((warning) => /4-15 second/.test(warning)));
@@ -130,12 +172,16 @@ test("metadata limits and scene ids are validated", () => {
 test("narration density emits a warning rather than corrupting the plan", () => {
   const raw = basePlan();
   raw.scenes[0].duration_s = 2;
-  raw.scenes[0].narration = "one two three four five six seven eight nine ten eleven twelve";
+  raw.scenes[0].narration =
+    "one two three four five six seven eight nine ten eleven twelve";
   const result = validatePlan(raw);
   assert.equal(result.ok, true);
   assert.ok(result.warnings.some((warning) => /narration has/.test(warning)));
 });
 
 test("stableHash ignores object key insertion order", () => {
-  assert.equal(stableHash({ b: 2, a: { y: 1, x: 0 } }), stableHash({ a: { x: 0, y: 1 }, b: 2 }));
+  assert.equal(
+    stableHash({ b: 2, a: { y: 1, x: 0 } }),
+    stableHash({ a: { x: 0, y: 1 }, b: 2 }),
+  );
 });

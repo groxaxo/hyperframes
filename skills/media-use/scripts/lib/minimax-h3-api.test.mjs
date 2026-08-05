@@ -8,6 +8,7 @@ import {
   downloadMiniMaxH3Video,
   minimaxApiBaseUrl,
   minimaxApiKey,
+  resumeMiniMaxH3Video,
   runMiniMaxH3Video,
   waitForMiniMaxH3Task,
 } from "./minimax-h3-api.mjs";
@@ -61,6 +62,38 @@ test("task creation uses the V2 endpoint, Bearer auth, and never retries POST", 
   assert.equal(JSON.parse(calls[0].options.body).model, "MiniMax-H3");
 });
 
+test("official error payload preserves type, request id, and HTTP status", async () => {
+  await assert.rejects(
+    createMiniMaxH3Task(
+      { model: "MiniMax-H3", content: [{ type: "text", text: "hello" }] },
+      {
+        apiKey: "secret",
+        fetch: async () =>
+          response({
+            status: 429,
+            json: {
+              type: "error",
+              error: {
+                type: "rate_limit_error",
+                message: "rate limit, please retry later (1002)",
+                http_code: "429",
+              },
+              request_id: "request-123",
+            },
+          }),
+      },
+    ),
+    (error) => {
+      assert.ok(error instanceof MiniMaxH3ApiError);
+      assert.equal(error.status, 429);
+      assert.equal(error.code, "rate_limit_error");
+      assert.equal(error.requestId, "request-123");
+      assert.equal(error.retryable, true);
+      return true;
+    },
+  );
+});
+
 test("polling follows the same task until it succeeds", async () => {
   const statuses = ["queued", "running", "succeeded"];
   const sleeps = [];
@@ -106,7 +139,7 @@ test("terminal task errors preserve the paid task id", async () => {
             task: {
               id: "paid-task",
               status: "failed",
-              error: { code: "1026", message: "sensitive input" },
+              error: { type: "content_policy_error", message: "sensitive input" },
             },
           },
         }),
@@ -114,13 +147,13 @@ test("terminal task errors preserve the paid task id", async () => {
     (error) => {
       assert.ok(error instanceof MiniMaxH3ApiError);
       assert.equal(error.taskId, "paid-task");
-      assert.match(error.message, /1026/);
+      assert.match(error.message, /content_policy_error/);
       return true;
     },
   );
 });
 
-test("download retries the same result URL without regenerating", async () => {
+test("download retries the same HTTPS result URL without regenerating", async () => {
   let calls = 0;
   const bytes = await downloadMiniMaxH3Video("https://cdn.example/video.mp4", {
     taskId: "task-3",
@@ -134,6 +167,39 @@ test("download retries the same result URL without regenerating", async () => {
   });
   assert.equal(calls, 2);
   assert.equal(bytes.toString(), "mp4-bytes");
+  await assert.rejects(
+    downloadMiniMaxH3Video("http://cdn.example/video.mp4", { taskId: "task-3" }),
+    /must be an HTTPS URL/,
+  );
+});
+
+test("resuming a known task polls and downloads without calling create", async () => {
+  const calls = [];
+  const result = await resumeMiniMaxH3Video("task-resume", {
+    apiKey: "secret",
+    pollIntervalMs: 0,
+    retries: 0,
+    sleep: async () => {},
+    fetch: async (url, options = {}) => {
+      calls.push({ url, method: options.method || "GET" });
+      if (url.includes("/v2/query/video_generation/task-resume")) {
+        return response({
+          json: {
+            task: {
+              id: "task-resume",
+              status: "succeeded",
+              content: { url: "https://cdn.example/task-resume.mp4" },
+            },
+          },
+        });
+      }
+      return response({ text: "resumed-video" });
+    },
+  });
+  assert.equal(result.taskId, "task-resume");
+  assert.equal(result.resumed, true);
+  assert.equal(result.bytes.toString(), "resumed-video");
+  assert.equal(calls.some((call) => call.method === "POST"), false);
 });
 
 test("end-to-end runner creates once, polls, and downloads", async () => {
@@ -173,6 +239,7 @@ test("end-to-end runner creates once, polls, and downloads", async () => {
     },
   );
   assert.equal(result.taskId, "task-4");
+  assert.equal(result.resumed, false);
   assert.equal(result.bytes.toString(), "final-video");
   assert.equal(calls.filter((call) => call.method === "POST").length, 1);
 });

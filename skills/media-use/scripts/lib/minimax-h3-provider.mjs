@@ -5,6 +5,7 @@ import {
   MINIMAX_H3_MODEL,
   MiniMaxH3ApiError,
   minimaxApiKey,
+  resumeMiniMaxH3Video,
   runMiniMaxH3Video,
 } from "./minimax-h3-api.mjs";
 
@@ -18,6 +19,7 @@ export const MINIMAX_H3_RATIOS = new Set([
   "3:4",
   "9:16",
 ]);
+export const MINIMAX_H3_RESOLUTIONS = new Set(["768P", "2K"]);
 
 const VERTICAL_INTENT =
   /\b(9\s*:\s*16|portrait|vertical|tiktok|reels?|instagram\s+story|youtube\s+shorts?)\b/i;
@@ -43,6 +45,27 @@ function integerSetting(name, value, fallback, { min, max }) {
   return selected;
 }
 
+function enumSetting(name, value, fallback, allowed) {
+  const selected = scalarString(value) || fallback;
+  if (!allowed.has(selected)) {
+    throw new Error(`${name} must be one of: ${[...allowed].join(", ")}`);
+  }
+  return selected;
+}
+
+function assertPublicHttpsUrl(name, value) {
+  let url;
+  try {
+    url = new URL(value);
+  } catch {
+    throw new Error(`${name} must contain valid URL strings`);
+  }
+  if (url.protocol !== "https:" || url.username || url.password) {
+    throw new Error(`${name} URLs must use HTTPS and must not embed credentials`);
+  }
+  return url.toString();
+}
+
 function stringArraySetting(name, value) {
   if (value == null || value === "") return [];
   let parsed = value;
@@ -56,7 +79,7 @@ function stringArraySetting(name, value) {
   if (!Array.isArray(parsed) || parsed.some((item) => typeof item !== "string" || !item.trim())) {
     throw new Error(`${name} must be a JSON array of non-empty URL strings`);
   }
-  return parsed.map((item) => item.trim());
+  return parsed.map((item) => assertPublicHttpsUrl(name, item.trim()));
 }
 
 export function resolveMiniMaxH3Duration(ctx = {}, env = process.env) {
@@ -68,7 +91,23 @@ export function resolveMiniMaxH3Duration(ctx = {}, env = process.env) {
   );
 }
 
-export function resolveMiniMaxH3Ratio(intent, ctx = {}, env = process.env, { hasMedia = false } = {}) {
+export function resolveMiniMaxH3Resolution(ctx = {}, env = process.env) {
+  return enumSetting(
+    "MINIMAX_H3_RESOLUTION",
+    ctx.resolution ?? env.MINIMAX_H3_RESOLUTION,
+    "2K",
+    MINIMAX_H3_RESOLUTIONS,
+  );
+}
+
+export function resolveMiniMaxH3Ratio(
+  intent,
+  ctx = {},
+  env = process.env,
+  { mode = "text" } = {},
+) {
+  if (mode === "frame") return "adaptive";
+
   const explicit = scalarString(ctx.ratio) || scalarString(env.MINIMAX_H3_RATIO);
   if (explicit) {
     if (!MINIMAX_H3_RATIOS.has(explicit)) {
@@ -76,33 +115,37 @@ export function resolveMiniMaxH3Ratio(intent, ctx = {}, env = process.env, { has
         `MINIMAX_H3_RATIO must be one of: ${[...MINIMAX_H3_RATIOS].join(", ")}`,
       );
     }
-    if (!hasMedia && explicit === "adaptive") {
+    if (mode === "text" && explicit === "adaptive") {
       throw new Error("MiniMax-H3 text-to-video requires a concrete ratio, not adaptive");
     }
     return explicit;
   }
-  if (hasMedia) return "adaptive";
+  if (mode === "reference") return "adaptive";
   return VERTICAL_INTENT.test(String(intent || "")) ? "9:16" : "16:9";
 }
 
 function referenceInputs(ctx = {}, env = process.env) {
-  const firstFrame =
-    scalarString(ctx.firstFrame) || scalarString(env.MINIMAX_H3_FIRST_FRAME);
-  const lastFrame =
-    scalarString(ctx.lastFrame) || scalarString(env.MINIMAX_H3_LAST_FRAME);
-  const referenceImages =
-    ctx.referenceImages ||
-    stringArraySetting("MINIMAX_H3_REFERENCE_IMAGES_JSON", env.MINIMAX_H3_REFERENCE_IMAGES_JSON);
-  const referenceVideos =
-    ctx.referenceVideos ||
-    stringArraySetting("MINIMAX_H3_REFERENCE_VIDEOS_JSON", env.MINIMAX_H3_REFERENCE_VIDEOS_JSON);
-  const referenceAudios =
-    ctx.referenceAudios ||
-    stringArraySetting("MINIMAX_H3_REFERENCE_AUDIOS_JSON", env.MINIMAX_H3_REFERENCE_AUDIOS_JSON);
+  const firstFrameRaw = scalarString(ctx.firstFrame) || scalarString(env.MINIMAX_H3_FIRST_FRAME);
+  const lastFrameRaw = scalarString(ctx.lastFrame) || scalarString(env.MINIMAX_H3_LAST_FRAME);
+  const firstFrame = firstFrameRaw
+    ? assertPublicHttpsUrl("MINIMAX_H3_FIRST_FRAME", firstFrameRaw)
+    : null;
+  const lastFrame = lastFrameRaw
+    ? assertPublicHttpsUrl("MINIMAX_H3_LAST_FRAME", lastFrameRaw)
+    : null;
+  const referenceImages = stringArraySetting(
+    "MINIMAX_H3_REFERENCE_IMAGES_JSON",
+    ctx.referenceImages ?? env.MINIMAX_H3_REFERENCE_IMAGES_JSON,
+  );
+  const referenceVideos = stringArraySetting(
+    "MINIMAX_H3_REFERENCE_VIDEOS_JSON",
+    ctx.referenceVideos ?? env.MINIMAX_H3_REFERENCE_VIDEOS_JSON,
+  );
+  const referenceAudios = stringArraySetting(
+    "MINIMAX_H3_REFERENCE_AUDIOS_JSON",
+    ctx.referenceAudios ?? env.MINIMAX_H3_REFERENCE_AUDIOS_JSON,
+  );
 
-  if (lastFrame && !firstFrame) {
-    throw new Error("MINIMAX_H3_LAST_FRAME requires MINIMAX_H3_FIRST_FRAME");
-  }
   if (referenceImages.length > 9) throw new Error("MiniMax-H3 accepts at most 9 reference images");
   if (referenceVideos.length > 3) throw new Error("MiniMax-H3 accepts at most 3 reference videos");
   if (referenceAudios.length > 3) throw new Error("MiniMax-H3 accepts at most 3 reference audios");
@@ -125,15 +168,14 @@ function referenceInputs(ctx = {}, env = process.env) {
     referenceImages,
     referenceVideos,
     referenceAudios,
-    hasMedia: frameMode || referenceMode,
+    mode: frameMode ? "frame" : referenceMode ? "reference" : "text",
   };
 }
 
 function h3Prompt(intent, ctx = {}, env = process.env) {
   const base = String(intent || "").trim();
   if (!base) throw new Error("MiniMax-H3 requires a non-empty prompt");
-  const negative =
-    scalarString(ctx.negativePrompt) || scalarString(env.MINIMAX_H3_NEGATIVE_PROMPT);
+  const negative = scalarString(ctx.negativePrompt) || scalarString(env.MINIMAX_H3_NEGATIVE_PROMPT);
   const prompt = negative
     ? `${base}\n\n[NEGATIVE CONSTRAINTS]\nAvoid ${negative}.`
     : base;
@@ -141,6 +183,11 @@ function h3Prompt(intent, ctx = {}, env = process.env) {
     throw new Error("MiniMax-H3 prompt must not exceed 7000 characters");
   }
   return prompt;
+}
+
+function callbackUrl(ctx = {}, env = process.env) {
+  const value = scalarString(ctx.callbackUrl) || scalarString(env.MINIMAX_H3_CALLBACK_URL);
+  return value ? assertPublicHttpsUrl("MINIMAX_H3_CALLBACK_URL", value) : null;
 }
 
 export function buildMiniMaxH3Request(intent, ctx = {}, env = process.env) {
@@ -170,34 +217,51 @@ export function buildMiniMaxH3Request(intent, ctx = {}, env = process.env) {
     content.push({ type: "audio_url", audio_url: { url }, role: "reference_audio" });
   }
 
+  const callback = callbackUrl(ctx, env);
   return {
     model: MINIMAX_H3_MODEL,
     content,
-    resolution: "2K",
+    resolution: resolveMiniMaxH3Resolution(ctx, env),
     duration: resolveMiniMaxH3Duration(ctx, env),
-    ratio: resolveMiniMaxH3Ratio(intent, ctx, env, { hasMedia: references.hasMedia }),
-    ...(scalarString(ctx.callbackUrl) || scalarString(env.MINIMAX_H3_CALLBACK_URL)
-      ? { callback_url: scalarString(ctx.callbackUrl) || scalarString(env.MINIMAX_H3_CALLBACK_URL) }
-      : {}),
+    ratio: resolveMiniMaxH3Ratio(intent, ctx, env, { mode: references.mode }),
+    ...(callback ? { callback_url: callback } : {}),
   };
+}
+
+function isIsoBaseMedia(bytes) {
+  if (!Buffer.isBuffer(bytes) || bytes.length < 12) return false;
+  const scanEnd = Math.min(bytes.length - 4, 64);
+  for (let offset = 4; offset <= scanEnd; offset += 1) {
+    if (bytes.subarray(offset, offset + 4).toString("ascii") === "ftyp") return true;
+  }
+  return false;
+}
+
+function resumeTaskId(ctx = {}, env = process.env) {
+  return scalarString(ctx.taskId) || scalarString(env.MINIMAX_H3_RESUME_TASK_ID);
+}
+
+function addTaskHint(error) {
+  if (!error?.taskId || String(error.message).includes(String(error.taskId))) return error;
+  error.message = `${error.message} [task_id: ${error.taskId}]`;
+  return error;
 }
 
 export async function miniMaxH3Generate(intent, ctx = {}, deps = {}) {
   const env = deps.env || process.env;
-  if (!forcedMiniMax(ctx) && !miniMaxH3AutoEnabled(env)) return null;
+  const forced = forcedMiniMax(ctx);
+  if (!forced && !miniMaxH3AutoEnabled(env)) return null;
 
   const apiKey = deps.apiKey || minimaxApiKey(env);
   if (!apiKey) {
-    if (forcedMiniMax(ctx)) {
-      console.error("media-use: MiniMax-H3 requires $MINIMAX_API_KEY");
-    }
+    if (forced) console.error("media-use: MiniMax-H3 requires $MINIMAX_API_KEY");
     return null;
   }
 
   try {
     const request = buildMiniMaxH3Request(intent, ctx, env);
-    const runVideo = deps.runVideo || runMiniMaxH3Video;
-    const result = await runVideo(request, {
+    const existingTaskId = resumeTaskId(ctx, env);
+    const apiOptions = {
       apiKey,
       env,
       fetch: deps.fetch,
@@ -217,7 +281,16 @@ export async function miniMaxH3Generate(intent, ctx = {}, deps = {}) {
         }),
       requestTimeoutMs: deps.requestTimeoutMs,
       retries: deps.retries,
-    });
+    };
+    const result = existingTaskId
+      ? await (deps.resumeVideo || resumeMiniMaxH3Video)(existingTaskId, apiOptions)
+      : await (deps.runVideo || runMiniMaxH3Video)(request, apiOptions);
+    if (!isIsoBaseMedia(result.bytes)) {
+      throw new MiniMaxH3ApiError(
+        "MiniMax-H3 returned bytes that are not a valid MP4/ISO base media file",
+        { code: "invalid_video_container", taskId: result.taskId },
+      );
+    }
     const outputPath = join(
       tmpdir(),
       `media-use-minimax-h3-${process.pid}-${result.taskId}-${Date.now()}.mp4`,
@@ -244,21 +317,21 @@ export async function miniMaxH3Generate(intent, ctx = {}, deps = {}) {
           prompt: request.content[0].text,
           model: MINIMAX_H3_MODEL,
           task_id: result.taskId,
+          resumed: Boolean(existingTaskId || result.resumed),
           resolution: result.task?.resolution || request.resolution,
           duration: result.task?.duration || request.duration,
           ratio: result.task?.ratio || request.ratio,
           task_type: result.task?.task_type || null,
           usage: result.task?.usage || null,
           reference_counts: referenceCounts,
-          native_audio: true,
+          native_audio: "probe",
         },
       },
     };
   } catch (error) {
+    addTaskHint(error);
     console.error(`media-use: MiniMax-H3 failed: ${error?.message || error}`);
-    // A task ID means a paid remote task may already exist. Propagate instead
-    // of falling through and creating a second paid video with another provider.
-    if (error instanceof MiniMaxH3ApiError && error.taskId) throw error;
+    if (forced || (error instanceof MiniMaxH3ApiError && error.taskId)) throw error;
     return null;
   }
 }

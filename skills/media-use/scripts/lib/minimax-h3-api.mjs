@@ -7,7 +7,13 @@ export const MINIMAX_H3_MIN_POLL_MS = 10_000;
 export class MiniMaxH3ApiError extends Error {
   constructor(
     message,
-    { status = null, code = null, retryable = false, taskId = null } = {},
+    {
+      status = null,
+      code = null,
+      retryable = false,
+      taskId = null,
+      requestId = null,
+    } = {},
   ) {
     super(message);
     this.name = "MiniMaxH3ApiError";
@@ -15,6 +21,7 @@ export class MiniMaxH3ApiError extends Error {
     this.code = code;
     this.retryable = retryable;
     this.taskId = taskId;
+    this.requestId = requestId;
   }
 }
 
@@ -72,21 +79,32 @@ function retryDelayMs(response, attempt) {
 }
 
 function apiDetail(raw) {
-  if (!raw) return { message: "", code: null };
+  if (!raw) return { message: "", code: null, requestId: null };
   try {
     const parsed = JSON.parse(raw);
     const base = parsed?.base_resp;
+    const error = parsed?.error;
+    const message = String(
+      error?.message || parsed?.message || base?.status_msg || raw,
+    ).trim();
+    const numericCode = /\((\d+)\)\s*$/.exec(message)?.[1] || null;
     return {
-      message: String(
-        parsed?.error?.message ||
-          parsed?.message ||
-          base?.status_msg ||
-          raw,
-      ).trim(),
-      code: parsed?.error?.code || base?.status_code || null,
+      message,
+      code:
+        error?.type ||
+        error?.code ||
+        error?.http_code ||
+        numericCode ||
+        base?.status_code ||
+        null,
+      requestId: parsed?.request_id || null,
     };
   } catch {
-    return { message: String(raw).trim().slice(0, 500), code: null };
+    return {
+      message: String(raw).trim().slice(0, 500),
+      code: null,
+      requestId: null,
+    };
   }
 }
 
@@ -138,6 +156,7 @@ async function requestJson(
             code: detail.code || "http_error",
             retryable: retryableStatus(response.status),
             taskId,
+            requestId: detail.requestId,
           },
         );
         lastError = error;
@@ -155,6 +174,19 @@ async function requestJson(
         throw new MiniMaxH3ApiError(
           `MiniMax H3 returned invalid JSON: ${error?.message || error}`,
           { code: "invalid_json", taskId },
+        );
+      }
+      if (data?.type === "error" || data?.error) {
+        const detail = apiDetail(JSON.stringify(data));
+        throw new MiniMaxH3ApiError(
+          `MiniMax H3 API error: ${detail.message || "unknown error"}`,
+          {
+            status: Number(data?.error?.http_code) || 200,
+            code: detail.code || "api_error",
+            retryable: ["rate_limit_error", "server_error"].includes(data?.error?.type),
+            taskId,
+            requestId: detail.requestId,
+          },
         );
       }
       if (data?.base_resp?.status_code && data.base_resp.status_code !== 0) {
@@ -213,6 +245,8 @@ export async function createMiniMaxH3Task(
       code: "missing_api_key",
     });
   }
+  // Creation is deliberately never retried. A timeout is ambiguous because the
+  // paid task may have been accepted even if the response did not reach us.
   const payload = await requestJson(miniMaxH3CreateUrl(baseUrl), {
     method: "POST",
     body: request,
@@ -268,7 +302,11 @@ export async function queryMiniMaxH3Task(
 }
 
 export function miniMaxH3FailureReason(task) {
-  const code = task?.error?.code ? String(task.error.code).trim() : "";
+  const code = task?.error?.code
+    ? String(task.error.code).trim()
+    : task?.error?.type
+      ? String(task.error.type).trim()
+      : "";
   const message = task?.error?.message ? String(task.error.message).trim() : "";
   if (code && message) return `${code}: ${message}`;
   return message || code || "unknown task failure";
@@ -353,11 +391,11 @@ export async function downloadMiniMaxH3Video(
       taskId,
     });
   }
-  if (!["https:", "http:"].includes(parsed.protocol) || parsed.username || parsed.password) {
-    throw new MiniMaxH3ApiError("MiniMax H3 result URL must be an HTTP(S) URL without credentials", {
-      code: "invalid_result_url",
-      taskId,
-    });
+  if (parsed.protocol !== "https:" || parsed.username || parsed.password) {
+    throw new MiniMaxH3ApiError(
+      "MiniMax H3 result URL must be an HTTPS URL without embedded credentials",
+      { code: "invalid_result_url", taskId },
+    );
   }
   if (typeof fetchImpl !== "function") {
     throw new MiniMaxH3ApiError("MiniMax H3 download transport unavailable", {
@@ -420,17 +458,30 @@ export async function downloadMiniMaxH3Video(
   throw lastError;
 }
 
-export async function runMiniMaxH3Video(request, options = {}) {
-  const taskId = await createMiniMaxH3Task(request, options);
+export async function resumeMiniMaxH3Video(taskId, options = {}) {
+  if (typeof taskId !== "string" || !taskId.trim()) {
+    throw new MiniMaxH3ApiError("MiniMax H3 resume requires a task id", {
+      code: "missing_task_id",
+    });
+  }
+  const normalizedTaskId = taskId.trim();
   try {
-    const task = await waitForMiniMaxH3Task(taskId, options);
+    const task = await waitForMiniMaxH3Task(normalizedTaskId, options);
     const bytes = await downloadMiniMaxH3Video(task.content.url, {
       ...options,
-      taskId,
+      taskId: normalizedTaskId,
     });
-    return { taskId, task, bytes };
+    return { taskId: normalizedTaskId, task, bytes, resumed: true };
   } catch (error) {
-    if (error instanceof MiniMaxH3ApiError && !error.taskId) error.taskId = taskId;
+    if (error instanceof MiniMaxH3ApiError && !error.taskId) {
+      error.taskId = normalizedTaskId;
+    }
     throw error;
   }
+}
+
+export async function runMiniMaxH3Video(request, options = {}) {
+  const taskId = await createMiniMaxH3Task(request, options);
+  const result = await resumeMiniMaxH3Video(taskId, options);
+  return { ...result, resumed: false };
 }

@@ -45,9 +45,7 @@ function boolean(value, fallback) {
 }
 
 function stringArray(value) {
-  return Array.isArray(value)
-    ? value.map((item) => string(item)).filter(Boolean)
-    : [];
+  return Array.isArray(value) ? value.map((item) => string(item)).filter(Boolean) : [];
 }
 
 function byteLength(value) {
@@ -118,8 +116,13 @@ function normalizeProduction(raw) {
     lead_in_s: Math.max(0, number(production.lead_in_s, 0.25)),
     tail_s: Math.max(0, number(production.tail_s, 0.35)),
     words_per_minute: Math.max(80, Math.min(240, number(production.words_per_minute, 165))),
-    max_concurrency: Math.max(1, Math.min(8, Math.round(number(production.max_concurrency, 1)))),
-    default_native_audio: ["mute", "duck", "keep"].includes(production.default_native_audio)
+    max_concurrency: Math.max(
+      1,
+      Math.min(8, Math.round(number(production.max_concurrency, 1))),
+    ),
+    default_native_audio: ["mute", "duck", "keep"].includes(
+      production.default_native_audio,
+    )
       ? production.default_native_audio
       : "mute",
     background_music: boolean(production.background_music, false),
@@ -138,21 +141,47 @@ function initialProvider(scene, policy, index) {
   return index === 0 ? "gemini" : "comfyui";
 }
 
+function providerCounts(scenes) {
+  const counts = new Map();
+  for (const scene of scenes) {
+    counts.set(scene.provider, (counts.get(scene.provider) || 0) + 1);
+  }
+  return counts;
+}
+
+function replacementScore(scene, index, required, counts) {
+  // Preserve the semantic allocation whenever possible: steal from an
+  // unneeded provider before a required provider, avoid hero roles, and avoid
+  // changing the first scene unless there is no safer implicit candidate.
+  const donorIsRequired = required.includes(scene.provider) ? 1 : 0;
+  const heroRole = ROLE_GEMINI.has(scene.role) ? 1 : 0;
+  const firstScene = index === 0 ? 1 : 0;
+  const donorCount = counts.get(scene.provider) || 0;
+  return donorIsRequired * 1_000 + heroRole * 100 + firstScene * 10 - donorCount;
+}
+
 function ensureRequiredProviders(scenes, required) {
   if (scenes.length < required.length) return scenes;
   const result = scenes.map((scene) => ({ ...scene }));
+
   for (const provider of required) {
     if (result.some((scene) => scene.provider === provider)) continue;
-    const target = result.findIndex(
-      (scene, index) =>
-        !scene.provider_explicit &&
-        !ROLE_GEMINI.has(scene.role) &&
-        index > 0 &&
-        !required.every((candidate) => result.some((entry) => entry.provider === candidate)),
-    );
-    const fallback = result.findIndex((scene) => !scene.provider_explicit);
-    const selected = target >= 0 ? target : fallback;
-    if (selected >= 0) result[selected].provider = provider;
+    const counts = providerCounts(result);
+    const candidates = result
+      .map((scene, index) => ({ scene, index }))
+      .filter(({ scene }) => {
+        if (scene.provider_explicit) return false;
+        // Never remove the only instance of a provider that this policy also
+        // requires; doing so merely moves the missing-rung problem around.
+        return !required.includes(scene.provider) || (counts.get(scene.provider) || 0) > 1;
+      })
+      .sort(
+        (a, b) =>
+          replacementScore(a.scene, a.index, required, counts) -
+            replacementScore(b.scene, b.index, required, counts) ||
+          a.index - b.index,
+      );
+    if (candidates.length) result[candidates[0].index].provider = provider;
   }
   return result;
 }
@@ -194,15 +223,18 @@ function normalizeScenes(raw, production) {
 
 function validateMetadata(plan, errors) {
   if (!plan.video.title) errors.push("video.title is required");
-  if (plan.video.title.length > 100) errors.push("video.title must be at most 100 characters");
+  if (plan.video.title.length > 100)
+    errors.push("video.title must be at most 100 characters");
   if (/[<>]/.test(plan.video.title)) errors.push("video.title cannot contain < or >");
   if (byteLength(plan.video.description) > 5000)
     errors.push("video.description must be at most 5000 UTF-8 bytes");
-  if (/[<>]/.test(plan.video.description)) errors.push("video.description cannot contain < or >");
+  if (/[<>]/.test(plan.video.description))
+    errors.push("video.description cannot contain < or >");
   const tagsLength = plan.video.tags
     .map((tag) => (tag.includes(" ") ? `\"${tag}\"` : tag))
     .join(",").length;
-  if (tagsLength > 500) errors.push("video.tags exceed YouTube's 500-character encoded limit");
+  if (tagsLength > 500)
+    errors.push("video.tags exceed YouTube's 500-character encoded limit");
 }
 
 function validateDimensions(plan, errors) {
@@ -226,7 +258,9 @@ function validateProviderCoverage(plan, errors) {
         : [];
   for (const provider of required) {
     if (!plan.scenes.some((scene) => scene.provider === provider)) {
-      errors.push(`${plan.production.provider_policy} production requires at least one ${provider} scene`);
+      errors.push(
+        `${plan.production.provider_policy} production requires at least one ${provider} scene`,
+      );
     }
   }
 }
@@ -236,7 +270,8 @@ function validateScenes(plan, errors, warnings) {
   const ids = new Set();
   for (const [index, scene] of plan.scenes.entries()) {
     const prefix = `scenes[${index}]`;
-    if (!ID_RE.test(scene.id)) errors.push(`${prefix}.id must be a kebab-case identifier`);
+    if (!ID_RE.test(scene.id))
+      errors.push(`${prefix}.id must be a kebab-case identifier`);
     if (ids.has(scene.id)) errors.push(`${prefix}.id duplicates ${scene.id}`);
     ids.add(scene.id);
     if (!scene.visual_prompt) errors.push(`${prefix}.visual_prompt is required`);
@@ -244,7 +279,10 @@ function validateScenes(plan, errors, warnings) {
       errors.push(`${prefix}.provider must be gemini, comfyui, or minimax`);
     if (scene.fallback_provider === scene.provider)
       errors.push(`${prefix}.fallback_provider must differ from provider`);
-    if (scene.provider === "minimax" && (scene.duration_s < 4 || scene.duration_s > 15)) {
+    if (
+      (scene.provider === "minimax" || scene.fallback_provider === "minimax") &&
+      (scene.duration_s < 4 || scene.duration_s > 15)
+    ) {
       warnings.push(
         `${prefix}.duration_s is outside MiniMax-H3's 4-15 second generation window; the source clip will be trimmed or padded during composition`,
       );
@@ -252,7 +290,9 @@ function validateScenes(plan, errors, warnings) {
     const estimatedWords = Math.floor(
       (scene.duration_s * plan.production.words_per_minute) / 60,
     );
-    const actualWords = scene.narration ? scene.narration.split(/\s+/).filter(Boolean).length : 0;
+    const actualWords = scene.narration
+      ? scene.narration.split(/\s+/).filter(Boolean).length
+      : 0;
     if (actualWords > estimatedWords + 2) {
       warnings.push(
         `${prefix}.narration has ${actualWords} words for ${scene.duration_s}s; target about ${estimatedWords} to avoid extending the shot`,
@@ -265,7 +305,9 @@ function validateScenes(plan, errors, warnings) {
 export function normalizePlan(raw) {
   const root = object(raw);
   const topic = string(root.topic);
-  const format = FORMATS.has(object(root.video).format) ? object(root.video).format : "long";
+  const format = FORMATS.has(object(root.video).format)
+    ? object(root.video).format
+    : "long";
   const production = normalizeProduction(root.production);
   return {
     version: PLAN_VERSION,

@@ -4,6 +4,7 @@ import {
   mkdirSync,
   readFileSync,
   rmSync,
+  statSync,
   writeFileSync,
 } from "node:fs";
 import { join, relative, resolve } from "node:path";
@@ -62,6 +63,24 @@ export function buildSchedule(plan, audioMeta = {}) {
   return { scenes, total_duration_s: round(cursor) };
 }
 
+export function applyVerifiedMediaCapabilities(schedule, visualManifest = {}) {
+  return {
+    ...schedule,
+    scenes: schedule.scenes.map((scene) => {
+      const record = visualManifest?.scenes?.[scene.id] || {};
+      const hasNativeAudio = record.has_native_audio === true;
+      const requested = record.native_audio_requested || scene.native_audio || "mute";
+      return {
+        ...scene,
+        native_audio_requested: requested,
+        native_audio: hasNativeAudio && requested !== "mute" ? requested : "mute",
+        has_native_audio: hasNativeAudio,
+        native_audio_verified: hasNativeAudio,
+      };
+    }),
+  };
+}
+
 export function buildNormalizeVideoArgs({
   inputPath,
   outputPath,
@@ -118,6 +137,15 @@ function runFfmpeg(args, { spawnSync = nodeSpawnSync, timeoutMs = 1_800_000 } = 
   return result;
 }
 
+function isNonEmptyFile(path) {
+  try {
+    const stat = statSync(path);
+    return stat.isFile() && stat.size > 0;
+  } catch {
+    return false;
+  }
+}
+
 export function normalizeVisualAssets(
   plan,
   schedule,
@@ -135,7 +163,7 @@ export function normalizeVisualAssets(
     const source = visualManifest?.scenes?.[scene.id];
     if (!source?.path) throw new Error(`visual manifest has no asset for scene ${scene.id}`);
     const inputPath = resolve(projectDir, source.path);
-    if (!existsSync(inputPath)) throw new Error(`scene ${scene.id} asset not found: ${source.path}`);
+    if (!isNonEmptyFile(inputPath)) throw new Error(`scene ${scene.id} asset is missing or empty: ${source.path}`);
     const outputPath = join(outDir, `${scene.id}.mp4`);
     const inputHash = stableHash({
       source,
@@ -156,7 +184,7 @@ export function normalizeVisualAssets(
       }),
       { spawnSync },
     );
-    if (!existsSync(outputPath)) throw new Error(`ffmpeg produced no normalized clip for ${scene.id}`);
+    if (!isNonEmptyFile(outputPath)) throw new Error(`ffmpeg produced no normalized clip for ${scene.id}`);
     records[scene.id] = {
       ...source,
       normalized_path: relative(projectDir, outputPath),
@@ -334,7 +362,7 @@ export function buildMainHtml(plan, schedule, normalized, audioMeta) {
     .join("\n");
 
   const nativeAudio = schedule.scenes
-    .filter((scene) => scene.native_audio !== "mute")
+    .filter((scene) => scene.native_audio !== "mute" && scene.native_audio_verified)
     .map((scene, index) => {
       const source = normalized[scene.id].path;
       const volume = scene.native_audio === "keep" ? 0.52 : 0.12;
@@ -359,13 +387,14 @@ export function buildMainHtml(plan, schedule, normalized, audioMeta) {
             sceneFade,
           )}, ease:"power2.in" }, ${round(scene.end_s - sceneFade)});`
         : "";
-      const bgmDuck = bgm && scene.voice_duration_s
-        ? `tl.to("#bgm", { volume:.07, duration:.22, ease:"sine.inOut" }, ${round(
-            Math.max(0, scene.narration_start_s - 0.15),
-          )});\ntl.to("#bgm", { volume:.16, duration:.35, ease:"sine.inOut" }, ${round(
-            scene.narration_end_s + 0.08,
-          )});`
-        : "";
+      const bgmDuck =
+        bgm && scene.voice_duration_s
+          ? `tl.to("#bgm", { volume:.07, duration:.22, ease:"sine.inOut" }, ${round(
+              Math.max(0, scene.narration_start_s - 0.15),
+            )});\ntl.to("#bgm", { volume:.16, duration:.35, ease:"sine.inOut" }, ${round(
+              scene.narration_end_s + 0.08,
+            )});`
+          : "";
       return `tl.fromTo("#video-${scene.id}", { autoAlpha:0, scale:1.025 }, { autoAlpha:1, scale:1, duration:${round(
         sceneFade,
       )}, ease:"power2.out" }, ${scene.start_s});\ntl.to("#video-${scene.id}", { autoAlpha:0, duration:${round(
@@ -504,7 +533,7 @@ function extractThumbnailHero(firstNormalizedPath, thumbnailDir, spawnSync) {
     ],
     { spawnSync },
   );
-  if (!existsSync(target)) throw new Error("ffmpeg produced no thumbnail hero frame");
+  if (!isNonEmptyFile(target)) throw new Error("ffmpeg produced no thumbnail hero frame");
   return target;
 }
 
@@ -522,7 +551,10 @@ export function composeProject(
   mkdirSync(projectDir, { recursive: true });
   mkdirSync(join(projectDir, "compositions"), { recursive: true });
   mkdirSync(join(projectDir, ".youtube-pipeline"), { recursive: true });
-  const schedule = buildSchedule(plan, audioMeta);
+  const schedule = applyVerifiedMediaCapabilities(
+    buildSchedule(plan, audioMeta),
+    visualManifest,
+  );
   const normalized = normalizeVisualAssets(plan, schedule, visualManifest, {
     projectDir,
     spawnSync,
@@ -559,6 +591,12 @@ export function composeProject(
     )}\n`,
   );
 
+  const expectedAudio = Boolean(
+    audioMeta?.bgm?.path ||
+      schedule.scenes.some(
+        (scene) => scene.voice_path || (scene.native_audio_verified && scene.native_audio !== "mute"),
+      ),
+  );
   const composition = {
     version: 1,
     plan_hash: stableHash(plan),
@@ -566,9 +604,17 @@ export function composeProject(
     width: plan.video.width,
     height: plan.video.height,
     fps: plan.video.fps,
+    expected_audio: expectedAudio,
     schedule,
     scenes: normalized,
     captions: groups,
+    audio: {
+      bgm_path: audioMeta?.bgm?.path || null,
+      voice_count: schedule.scenes.filter((scene) => scene.voice_path).length,
+      verified_native_audio_count: schedule.scenes.filter(
+        (scene) => scene.native_audio_verified && scene.native_audio !== "mute",
+      ).length,
+    },
     files: {
       index: "index.html",
       captions_html: "compositions/captions.html",
