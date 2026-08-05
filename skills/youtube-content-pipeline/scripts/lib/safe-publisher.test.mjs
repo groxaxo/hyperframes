@@ -49,6 +49,14 @@ async function consumeBody(body) {
   }
 }
 
+function isCaptionInsert(url) {
+  return url.includes("/upload/youtube/v3/captions?");
+}
+
+function isCaptionList(url) {
+  return url.includes("/youtube/v3/captions?") && !isCaptionInsert(url);
+}
+
 test("dry-run validates the package without OAuth or network", async () => {
   const dir = makePackage();
   try {
@@ -84,10 +92,8 @@ test("successful publishing checkpoints session, video, thumbnail, captions, and
           return response({ status: 201, json: { id: "video123" } });
         }
         if (url.includes("/thumbnails/set")) return response({ json: { items: [] } });
-        if (url.includes("/youtube/v3/captions?")) return response({ json: { items: [] } });
-        if (url.includes("/upload/youtube/v3/captions?")) {
-          return response({ json: { id: "caption123" } });
-        }
+        if (isCaptionInsert(url)) return response({ json: { id: "caption123" } });
+        if (isCaptionList(url)) return response({ json: { items: [] } });
         throw new Error(`unexpected URL: ${url}`);
       },
     });
@@ -152,7 +158,7 @@ test("a post-upload failure preserves the video id and resumes without a duplica
           throw new Error("video upload must not repeat");
         }
         if (url.includes("/thumbnails/set")) return response({ json: { items: [] } });
-        if (url.includes("/youtube/v3/captions?")) {
+        if (isCaptionList(url)) {
           return response({
             json: {
               items: [{ id: "existing-caption", snippet: { language: "en-NZ", name: "en-NZ" } }],
@@ -167,6 +173,34 @@ test("a post-upload failure preserves the video id and resumes without a duplica
     assert.equal(resumed.video_id, "video456");
     assert.equal(resumed.caption_id, "existing-caption");
     assert.equal(resumed.publish_complete, true);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("a crash after upload can recover the video id from the persisted resumable session", async () => {
+  const dir = makePackage();
+  const checkpoints = [];
+  try {
+    const result = await publishYouTubePackageSafely(plan(), dir, {
+      env: { YOUTUBE_ACCESS_TOKEN: "token" },
+      publishFingerprint: "fingerprint-session",
+      resume: { sessionUrl: "https://upload.example/completed" },
+      onCheckpoint: async (checkpoint) => checkpoints.push(checkpoint.stage),
+      fetch: async (url, options = {}) => {
+        if (url === "https://upload.example/completed") {
+          assert.equal(options.headers["Content-Range"], "bytes */5");
+          return response({ json: { id: "recovered-video" } });
+        }
+        if (url.includes("/thumbnails/set")) return response({ json: {} });
+        if (isCaptionList(url)) return response({ json: { items: [] } });
+        if (isCaptionInsert(url)) return response({ json: { id: "recovered-caption" } });
+        throw new Error(`unexpected URL: ${url}`);
+      },
+    });
+    assert.equal(result.video_id, "recovered-video");
+    assert.ok(checkpoints.includes("video_recovered_from_session"));
+    assert.equal(checkpoints.includes("video_uploaded"), false);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -199,8 +233,8 @@ test("a changed publish fingerprint never reuses an older video's checkpoint", a
           return response({ status: 201, json: { id: "new-video" } });
         }
         if (url.includes("/thumbnails/set")) return response({ json: {} });
-        if (url.includes("/youtube/v3/captions?")) return response({ json: { items: [] } });
-        if (url.includes("/upload/youtube/v3/captions?")) return response({ json: { id: "new-caption" } });
+        if (isCaptionInsert(url)) return response({ json: { id: "new-caption" } });
+        if (isCaptionList(url)) return response({ json: { items: [] } });
         throw new Error(`unexpected URL: ${url}`);
       },
     });
