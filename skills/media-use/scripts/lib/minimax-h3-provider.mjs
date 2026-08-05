@@ -5,6 +5,7 @@ import {
   MINIMAX_H3_MODEL,
   MiniMaxH3ApiError,
   minimaxApiKey,
+  resumeMiniMaxH3Video,
   runMiniMaxH3Video,
 } from "./minimax-h3-api.mjs";
 
@@ -105,9 +106,6 @@ export function resolveMiniMaxH3Ratio(
   env = process.env,
   { mode = "text" } = {},
 ) {
-  // H3 always derives image-to-video geometry from the first/last frame. The
-  // API accepts concrete ratios in this mode but ignores them, so normalize the
-  // request and provenance to the actual behavior instead of recording a lie.
   if (mode === "frame") return "adaptive";
 
   const explicit = scalarString(ctx.ratio) || scalarString(env.MINIMAX_H3_RATIO);
@@ -127,58 +125,49 @@ export function resolveMiniMaxH3Ratio(
 }
 
 function referenceInputs(ctx = {}, env = process.env) {
-  const firstFrameRaw =
-    scalarString(ctx.firstFrame) || scalarString(env.MINIMAX_H3_FIRST_FRAME);
-  const lastFrameRaw =
-    scalarString(ctx.lastFrame) || scalarString(env.MINIMAX_H3_LAST_FRAME);
+  const firstFrameRaw = scalarString(ctx.firstFrame) || scalarString(env.MINIMAX_H3_FIRST_FRAME);
+  const lastFrameRaw = scalarString(ctx.lastFrame) || scalarString(env.MINIMAX_H3_LAST_FRAME);
   const firstFrame = firstFrameRaw
     ? assertPublicHttpsUrl("MINIMAX_H3_FIRST_FRAME", firstFrameRaw)
     : null;
   const lastFrame = lastFrameRaw
     ? assertPublicHttpsUrl("MINIMAX_H3_LAST_FRAME", lastFrameRaw)
     : null;
-  const referenceImages =
-    ctx.referenceImages ||
-    stringArraySetting("MINIMAX_H3_REFERENCE_IMAGES_JSON", env.MINIMAX_H3_REFERENCE_IMAGES_JSON);
-  const referenceVideos =
-    ctx.referenceVideos ||
-    stringArraySetting("MINIMAX_H3_REFERENCE_VIDEOS_JSON", env.MINIMAX_H3_REFERENCE_VIDEOS_JSON);
-  const referenceAudios =
-    ctx.referenceAudios ||
-    stringArraySetting("MINIMAX_H3_REFERENCE_AUDIOS_JSON", env.MINIMAX_H3_REFERENCE_AUDIOS_JSON);
-
-  const normalizedImages = referenceImages.map((value) =>
-    assertPublicHttpsUrl("MINIMAX_H3_REFERENCE_IMAGES_JSON", value),
+  const referenceImages = stringArraySetting(
+    "MINIMAX_H3_REFERENCE_IMAGES_JSON",
+    ctx.referenceImages ?? env.MINIMAX_H3_REFERENCE_IMAGES_JSON,
   );
-  const normalizedVideos = referenceVideos.map((value) =>
-    assertPublicHttpsUrl("MINIMAX_H3_REFERENCE_VIDEOS_JSON", value),
+  const referenceVideos = stringArraySetting(
+    "MINIMAX_H3_REFERENCE_VIDEOS_JSON",
+    ctx.referenceVideos ?? env.MINIMAX_H3_REFERENCE_VIDEOS_JSON,
   );
-  const normalizedAudios = referenceAudios.map((value) =>
-    assertPublicHttpsUrl("MINIMAX_H3_REFERENCE_AUDIOS_JSON", value),
+  const referenceAudios = stringArraySetting(
+    "MINIMAX_H3_REFERENCE_AUDIOS_JSON",
+    ctx.referenceAudios ?? env.MINIMAX_H3_REFERENCE_AUDIOS_JSON,
   );
 
-  if (normalizedImages.length > 9) throw new Error("MiniMax-H3 accepts at most 9 reference images");
-  if (normalizedVideos.length > 3) throw new Error("MiniMax-H3 accepts at most 3 reference videos");
-  if (normalizedAudios.length > 3) throw new Error("MiniMax-H3 accepts at most 3 reference audios");
+  if (referenceImages.length > 9) throw new Error("MiniMax-H3 accepts at most 9 reference images");
+  if (referenceVideos.length > 3) throw new Error("MiniMax-H3 accepts at most 3 reference videos");
+  if (referenceAudios.length > 3) throw new Error("MiniMax-H3 accepts at most 3 reference audios");
 
   const frameMode = Boolean(firstFrame || lastFrame);
   const referenceMode =
-    normalizedImages.length > 0 || normalizedVideos.length > 0 || normalizedAudios.length > 0;
+    referenceImages.length > 0 || referenceVideos.length > 0 || referenceAudios.length > 0;
   if (frameMode && referenceMode) {
     throw new Error("MiniMax-H3 frame inputs and reference inputs cannot be combined");
   }
-  if (normalizedAudios.length && !normalizedImages.length && !normalizedVideos.length) {
+  if (referenceAudios.length && !referenceImages.length && !referenceVideos.length) {
     throw new Error("MiniMax-H3 reference audio requires a reference image or reference video");
   }
-  if (normalizedImages.length + normalizedVideos.length + normalizedAudios.length > 12) {
+  if (referenceImages.length + referenceVideos.length + referenceAudios.length > 12) {
     throw new Error("MiniMax-H3 accepts at most 12 total reference media items");
   }
   return {
     firstFrame,
     lastFrame,
-    referenceImages: normalizedImages,
-    referenceVideos: normalizedVideos,
-    referenceAudios: normalizedAudios,
+    referenceImages,
+    referenceVideos,
+    referenceAudios,
     mode: frameMode ? "frame" : referenceMode ? "reference" : "text",
   };
 }
@@ -186,8 +175,7 @@ function referenceInputs(ctx = {}, env = process.env) {
 function h3Prompt(intent, ctx = {}, env = process.env) {
   const base = String(intent || "").trim();
   if (!base) throw new Error("MiniMax-H3 requires a non-empty prompt");
-  const negative =
-    scalarString(ctx.negativePrompt) || scalarString(env.MINIMAX_H3_NEGATIVE_PROMPT);
+  const negative = scalarString(ctx.negativePrompt) || scalarString(env.MINIMAX_H3_NEGATIVE_PROMPT);
   const prompt = negative
     ? `${base}\n\n[NEGATIVE CONSTRAINTS]\nAvoid ${negative}.`
     : base;
@@ -249,6 +237,16 @@ function isIsoBaseMedia(bytes) {
   return false;
 }
 
+function resumeTaskId(ctx = {}, env = process.env) {
+  return scalarString(ctx.taskId) || scalarString(env.MINIMAX_H3_RESUME_TASK_ID);
+}
+
+function addTaskHint(error) {
+  if (!error?.taskId || String(error.message).includes(String(error.taskId))) return error;
+  error.message = `${error.message} [task_id: ${error.taskId}]`;
+  return error;
+}
+
 export async function miniMaxH3Generate(intent, ctx = {}, deps = {}) {
   const env = deps.env || process.env;
   const forced = forcedMiniMax(ctx);
@@ -256,16 +254,14 @@ export async function miniMaxH3Generate(intent, ctx = {}, deps = {}) {
 
   const apiKey = deps.apiKey || minimaxApiKey(env);
   if (!apiKey) {
-    if (forced) {
-      console.error("media-use: MiniMax-H3 requires $MINIMAX_API_KEY");
-    }
+    if (forced) console.error("media-use: MiniMax-H3 requires $MINIMAX_API_KEY");
     return null;
   }
 
   try {
     const request = buildMiniMaxH3Request(intent, ctx, env);
-    const runVideo = deps.runVideo || runMiniMaxH3Video;
-    const result = await runVideo(request, {
+    const existingTaskId = resumeTaskId(ctx, env);
+    const apiOptions = {
       apiKey,
       env,
       fetch: deps.fetch,
@@ -285,7 +281,10 @@ export async function miniMaxH3Generate(intent, ctx = {}, deps = {}) {
         }),
       requestTimeoutMs: deps.requestTimeoutMs,
       retries: deps.retries,
-    });
+    };
+    const result = existingTaskId
+      ? await (deps.resumeVideo || resumeMiniMaxH3Video)(existingTaskId, apiOptions)
+      : await (deps.runVideo || runMiniMaxH3Video)(request, apiOptions);
     if (!isIsoBaseMedia(result.bytes)) {
       throw new MiniMaxH3ApiError(
         "MiniMax-H3 returned bytes that are not a valid MP4/ISO base media file",
@@ -318,26 +317,20 @@ export async function miniMaxH3Generate(intent, ctx = {}, deps = {}) {
           prompt: request.content[0].text,
           model: MINIMAX_H3_MODEL,
           task_id: result.taskId,
+          resumed: Boolean(existingTaskId || result.resumed),
           resolution: result.task?.resolution || request.resolution,
           duration: result.task?.duration || request.duration,
           ratio: result.task?.ratio || request.ratio,
           task_type: result.task?.task_type || null,
           usage: result.task?.usage || null,
           reference_counts: referenceCounts,
-          // H3 can use audio as a reference, but the API contract does not
-          // promise that every resulting MP4 contains an audio stream. The
-          // YouTube composer probes the frozen source before mounting it as
-          // native audio instead of assuming one exists.
           native_audio: "probe",
         },
       },
     };
   } catch (error) {
+    addTaskHint(error);
     console.error(`media-use: MiniMax-H3 failed: ${error?.message || error}`);
-    // Explicit H3 selection is a paid operation. Even a creation timeout with
-    // no task ID is ambiguous—the server may have accepted the request—so never
-    // fall through and submit another provider automatically. Auto-enabled H3
-    // may fall through only when no task was created and it was not forced.
     if (forced || (error instanceof MiniMaxH3ApiError && error.taskId)) throw error;
     return null;
   }
