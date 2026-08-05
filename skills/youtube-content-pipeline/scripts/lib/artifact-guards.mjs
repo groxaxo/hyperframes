@@ -90,6 +90,7 @@ export function publishArtifactsCurrent(paths) {
   return Boolean(
     receipt?.video_id &&
       receipt?.video_upload_complete &&
+      receipt?.metadata_set &&
       receipt?.thumbnail_set &&
       (receipt?.caption_id || receipt?.captions_skipped) &&
       receipt?.publish_complete,
@@ -140,6 +141,15 @@ export function compositionInputFingerprint(projectDir, composition) {
       composition?.audio?.bgm_path,
     ].filter(Boolean),
   );
+}
+
+export function packageAssetFingerprints(packageDir) {
+  return {
+    video: hashFileOrMissing(join(packageDir, "video.mp4")),
+    thumbnail: hashFileOrMissing(join(packageDir, "thumbnail.jpg")),
+    captions: hashFileOrMissing(join(packageDir, "captions.srt")),
+    metadata: hashFileOrMissing(join(packageDir, "metadata.json")),
+  };
 }
 
 export function packageUploadFingerprint(packageDir) {
